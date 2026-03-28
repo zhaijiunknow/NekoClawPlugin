@@ -1,0 +1,1 @@
+import{p as e,A as t,u as o,H as s}from"./style-rM6B2R_a.js";const n={class:"flex flex-col justify-between gap-2 mb-2 items-start md:flex-row md:items-center"},a=s("h2",{class:"font-bold text-xl"},"连接码",-1),c=[a],l=e({name:"GameConnection",__name:"GameConnection",setup(m){return(_,r)=>(o(),t("div",n,c))}});export{l as default};

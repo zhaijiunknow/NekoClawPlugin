@@ -1,0 +1,1 @@
+import{r as o,w as u}from"./style-rM6B2R_a.js";function c(r,a){const t=o(r.value);let e=null,n=r.value;const i=()=>{if(n===t.value&&e){clearInterval(e),e=null;return}else n>t.value?t.value+=1:t.value-=1},l=()=>{e||(e=setInterval(i,1e3/a))};return u(r,s=>{n=s,l()}),t}export{c as t};

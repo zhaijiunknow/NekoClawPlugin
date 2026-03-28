@@ -1,0 +1,30 @@
+[plugin]
+name = "DG-Lab Hub 控制"
+description = "通过 DG-Lab-Coyote-Game-Hub 的 HTTP API 控制 DG-Lab，支持查询状态、设置强度、设置波形和一键开火。"
+version = "0.1.0"
+id = "dg_lab_hub"
+entry = "plugin.plugins.dg_lab_hub:DGLabHubPlugin"
+
+[plugin.author]
+name = "zhaijiu"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[plugin.store]
+enabled = false
+
+[dg_lab_hub]
+base_url = "http://127.0.0.1:8920"
+client_id = ""
+timeout_seconds = 10
+allow_broadcast_all = false
+auto_start_hub = false
+hub_dir = "coyote-game-hub"
+startup_timeout_seconds = 20
+show_hub_window = true
