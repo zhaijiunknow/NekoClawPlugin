@@ -715,17 +715,41 @@ class SunoCnMusicPlugin(NekoPluginBase):
             "instruction": "歌词已生成。如需用这段歌词生成音乐，请使用 generate_music 并设置 custom_mode=true。",
         })
 
+    def _open_url(self, url: str, title: str = ""):
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return Err(SdkError("仅支持 http/https URL"))
+
+        title = str(title).strip()
+        title_display = f"（{title}）" if title else ""
+        self.logger.info("Opening URL{}: {}", title_display, url)
+
+        try:
+            opened = webbrowser.open(url)
+        except Exception as e:
+            self.logger.exception("Failed to open URL: {}", url)
+            return Err(SdkError(f"无法打开 URL: {str(e)}"))
+
+        if not opened:
+            self.logger.warning("webbrowser.open returned false for url={}", url)
+            return Err(SdkError("系统未能打开默认浏览器，请检查系统浏览器设置"))
+
+        return Ok({
+            "status": "opened",
+            "url": url,
+            "message": f"已打开链接{title_display}",
+        })
+
     @plugin_entry(
         id="play_audio",
-        name="播放音频/打开链接",
-        description="播放 Suno 生成的音频或打开任意网页链接。用户说播放刚才生成的歌、打开链接、打开网页时调用。如果没有提供 URL，会自动播放最近一次生成的音乐。",
+        name="播放音频",
+        description="播放 Suno 生成的音乐或音频链接。用户说播放刚才生成的歌、播放这首歌、播放音频链接时调用。如果不提供 URL，会自动播放最近一次生成的音乐。",
         llm_result_fields=["status", "url", "message"],
         input_schema={
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "要打开的 URL（音频链接、网页链接均可）。如果不提供，会自动播放最近一次生成的音乐。",
+                    "description": "要播放的音频 URL。若不提供，会自动播放最近一次生成的音乐。",
                 },
                 "title": {
                     "type": "string",
@@ -786,25 +810,33 @@ class SunoCnMusicPlugin(NekoPluginBase):
                 "message": f"已推送到 N.E.K.O 播放器播放{title_display}",
             })
 
-        title = str(title).strip()
-        title_display = f"（{title}）" if title else ""
-        self.logger.info("Opening URL{}: {}", title_display, url)
+        return self._open_url(url, title)
 
-        try:
-            opened = webbrowser.open(url)
-        except Exception as e:
-            self.logger.exception("Failed to open URL: {}", url)
-            return Err(SdkError(f"无法打开 URL: {str(e)}"))
-
-        if not opened:
-            self.logger.warning("webbrowser.open returned false for url={}", url)
-            return Err(SdkError("系统未能打开默认浏览器，请检查系统浏览器设置"))
-
-        return Ok({
-            "status": "opened",
-            "url": url,
-            "message": f"已打开链接{title_display}",
-        })
+    @plugin_entry(
+        id="open_url",
+        name="打开链接",
+        description="打开网页链接。用户说打开链接、打开网页、打开这个网址时调用。仅用于打开普通 http/https URL，不负责播放最近生成的音乐。",
+        llm_result_fields=["status", "url", "message"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要打开的网页 URL，必须为 http/https。",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "标题（可选，仅用于日志和返回信息）",
+                },
+            },
+            "required": ["url"],
+        },
+    )
+    async def open_url(self, url: str, title: str = "", **_):
+        url = str(url).strip()
+        if not url:
+            return Err(SdkError("URL 不能为空"))
+        return self._open_url(url, title)
 
     @plugin_entry(
         id="set_api_key",
