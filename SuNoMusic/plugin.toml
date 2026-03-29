@@ -20,6 +20,6 @@ auto_start = true
 enabled = true
 
 [suno]
-api_key = ""
+api_key = "sk-9507439e7672ffb8e052eafb753159349779a844dbd5cdca5ee8651332a0"
 base_url = "https://mcp.suno.cn"
 timeout_seconds = 60

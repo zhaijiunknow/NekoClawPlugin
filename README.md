@@ -1,6 +1,6 @@
 # N.E.K.O 插件制作指南
 
-本文基于当前 `https://github.com/Project-N-E-K-O/N.E.K.O` 仓库里的真实实现整理，目标是让你按现有 SDK 和项目约定编写可运行的 N.E.K.O 插件，而不是写一套脱离仓库实际情况的“理想化接口”。
+本文基于当前 `https://github.com/Project-N-E-K-O/N.E.K.O` 仓库里的真实实现整理，目标是让你按现有 SDK 和项目约定编写可运行的 N.E.K.O 插件。
 
 ## 1. 先认识当前插件体系
 
@@ -26,7 +26,7 @@ N.E.K.O 对外导出的插件能力集中在 `https://github.com/Project-N-E-K-O
 
 ## 2. 一个插件最少要有什么文件
 
-按当前项目里的真实插件写法，一个插件目录至少要有：
+一个插件目录至少要有：
 
 ```text
 plugin/plugins/your_plugin/
@@ -296,8 +296,6 @@ async def shutdown(self, **_):
 
 ## 6. 配置怎么读取
 
-当前项目中的真实写法很统一：
-
 ```python
 cfg = await self.config.dump(timeout=5.0)
 cfg = cfg if isinstance(cfg, dict) else {}
@@ -343,7 +341,7 @@ memo_cfg = cfg.get("memo") if isinstance(cfg.get("memo"), dict) else {}
 - `Ok(value)`：成功
 - `Err(error)`：失败
 
-现有插件里最常见的错误写法是：
+现有插件里的错误写法是：
 
 ```python
 return Err(SdkError("错误说明"))
@@ -365,7 +363,7 @@ async def echo(self, text: str, **_):
 
 ### 7.3 为什么不要直接乱抛异常
 
-从当前插件习惯看，入口函数更推荐把用户可理解的失败包装成 `Err(SdkError(...))` 返回，这样错误语义更稳定，也更符合项目已有模式。
+入口函数更推荐把用户可理解的失败包装成 `Err(SdkError(...))` 返回，这样错误语义更稳定，也更符合项目已有模式。
 
 ---
 
@@ -451,7 +449,7 @@ def _store_set_sync(self, key: str, value):
 
 注意：
 
-这里看到的是当前项目中的实际用法，但 `_read_value/_write_value` 看起来偏底层接口。写文档和写插件时，建议把它理解为“现有实践”，而不是假设它是未来永远不变的唯一官方接口。
+ `_read_value/_write_value` 偏底层接口。写文档和写插件时，建议把它理解为“现有实践”，而不是假设它是未来永远不变的唯一官方接口。
 
 ---
 

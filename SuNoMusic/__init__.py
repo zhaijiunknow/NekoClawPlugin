@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 from pathlib import Path
+from urllib.parse import urlparse
 import threading
 import time
 import webbrowser
@@ -54,6 +55,60 @@ class SunoCnMusicPlugin(NekoPluginBase):
             self.store._write_value(key, value)
         except Exception as exc:
             self.logger.warning("Store set failed for key {!r}: {}", key, exc)
+
+    def _get_latest_audio_cache(self, lanlan_name: Optional[str] = None) -> dict[str, Any] | None:
+        cache_key = f"latest_audio:{lanlan_name or '__global__'}"
+        cached = self._store_get_sync(cache_key)
+        return cached if isinstance(cached, dict) else None
+
+    def _normalize_audio_item(self, item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        url = str(item.get("play_url", "")).strip()
+        if not url:
+            return None
+        return {
+            "serial_no": str(item.get("serial_no", "")).strip(),
+            "title": str(item.get("title", "未命名歌曲")).strip() or "未命名歌曲",
+            "artist": str(item.get("artist", "Suno")).strip() or "Suno",
+            "url": url,
+            "cover": str(item.get("cover", "")).strip(),
+            "duration": int(item.get("duration", 0) or 0),
+        }
+
+    def _find_cached_audio_item(self, url: str, lanlan_name: Optional[str] = None) -> dict[str, Any] | None:
+        normalized_url = str(url).strip()
+        if not normalized_url:
+            return None
+        cached = self._get_latest_audio_cache(lanlan_name)
+        if not cached:
+            return None
+        items = cached.get("items", [])
+        if not isinstance(items, list):
+            return None
+        for item in items:
+            normalized = self._normalize_audio_item(item)
+            if normalized and normalized.get("url") == normalized_url:
+                return normalized
+        return None
+
+    def _push_native_music_play(self, track: dict[str, Any]) -> None:
+        url = str(track.get("url", "")).strip()
+        if not url:
+            raise ValueError("音乐链接不能为空")
+
+        parsed = urlparse(url)
+        host_or_url = parsed.hostname or url
+        self.register_music_domains([host_or_url])
+        self.ctx.push_message(
+            source=self.plugin_id,
+            message_type="music_play_url",
+            metadata={
+                "url": url,
+                "name": str(track.get("title", "未命名歌曲")).strip() or "未命名歌曲",
+                "artist": str(track.get("artist", "Suno")).strip() or "Suno",
+            },
+        )
 
     @lifecycle(id="startup")
     async def startup(self, **_):
@@ -681,17 +736,17 @@ class SunoCnMusicPlugin(NekoPluginBase):
     )
     async def play_audio(self, url: str = "", title: str = "", **kwargs):
         url = str(url).strip()
+        ctx_obj = kwargs.get("_ctx")
+        lanlan_name = None
+        if isinstance(ctx_obj, dict):
+            lanlan_name = ctx_obj.get("lanlan_name")
+        if not lanlan_name:
+            lanlan_name = getattr(self.ctx, "_current_lanlan", None)
+
+        track: dict[str, Any] | None = None
 
         if not url:
-            ctx_obj = kwargs.get("_ctx")
-            lanlan_name = None
-            if isinstance(ctx_obj, dict):
-                lanlan_name = ctx_obj.get("lanlan_name")
-            if not lanlan_name:
-                lanlan_name = getattr(self.ctx, "_current_lanlan", None)
-
-            cache_key = f"latest_audio:{lanlan_name or '__global__'}"
-            cached = self._store_get_sync(cache_key)
+            cached = self._get_latest_audio_cache(lanlan_name)
 
             if not cached or not isinstance(cached, dict):
                 return Err(SdkError("没有找到最近生成的音乐，请先生成音乐或提供 URL"))
@@ -700,18 +755,36 @@ class SunoCnMusicPlugin(NekoPluginBase):
             if not items or not isinstance(items, list):
                 return Err(SdkError("没有找到最近生成的音乐，请先生成音乐或提供 URL"))
 
-            latest = items[0]
-            url = latest.get("play_url", "")
-            if not title:
-                title = latest.get("title", "")
-
-            if not url:
+            track = self._normalize_audio_item(items[0])
+            if not track:
                 return Err(SdkError("最近生成的音乐没有播放链接"))
 
-            self.logger.info("Using cached audio: {}", latest)
+            url = track["url"]
+            if not title:
+                title = track["title"]
+
+            self.logger.info("Using cached audio: {}", track)
+        else:
+            track = self._find_cached_audio_item(url, lanlan_name)
+            if track and not title:
+                title = track["title"]
 
         if not (url.startswith("http://") or url.startswith("https://")):
             return Err(SdkError("仅支持 http/https URL"))
+
+        if track:
+            title_display = f"（{track.get('title', '未命名歌曲')}）"
+            try:
+                self._push_native_music_play(track)
+            except Exception as e:
+                self.logger.exception("Failed to dispatch music to native player: {}", url)
+                return Err(SdkError(f"无法推送到 N.E.K.O 播放器: {str(e)}"))
+
+            return Ok({
+                "status": "queued",
+                "url": track["url"],
+                "message": f"已推送到 N.E.K.O 播放器播放{title_display}",
+            })
 
         title = str(title).strip()
         title_display = f"（{title}）" if title else ""
