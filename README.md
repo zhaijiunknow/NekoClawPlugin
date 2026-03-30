@@ -14,6 +14,7 @@ N.E.K.O 对外导出的插件能力集中在 `https://github.com/Project-N-E-K-O
 - `timer_interval`
 - `SystemInfo`
 - `MemoryClient`
+- `Music`
 
 如果你只是想先写一个最小插件，真正必须掌握的只有四个：
 
@@ -332,7 +333,7 @@ memo_cfg = cfg.get("memo") if isinstance(cfg.get("memo"), dict) else {}
 
 ### 7.1 用 `Ok` / `Err`
 
-当前项目用的是显式 Result 风格。定义见：
+定义见：
 
 - `https://github.com/Project-N-E-K-O/N.E.K.O/plugin/_types/result.py:37-177`
 
