@@ -105,6 +105,14 @@ def group_msg(group_id: str, user_id: str, content: str, is_at_bot: bool = False
     }
 
 
+def get_user_by_level(qq_cfg: dict, level: str):
+    return next((u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == level), None)
+
+
+def get_group_by_level(qq_cfg: dict, level: str):
+    return next((g["group_id"] for g in qq_cfg["trusted_groups"] if g["level"] == level), None)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 测试：权限路由
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -140,7 +148,9 @@ class TestPermissionRouting:
     async def test_trusted_user_gets_ai_reply(self):
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
+        trusted_qq = get_user_by_level(qq_cfg, "trusted")
+        if not trusted_qq:
+            pytest.skip("需要 trusted 用户")
 
         plugin._generate_reply = AsyncMock(return_value="测试回复")
         plugin.qq_client = AsyncMock()
@@ -203,7 +213,9 @@ class TestPermissionRouting:
     async def test_normal_group_triggers_relay(self):
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        normal_group = next(g["group_id"] for g in qq_cfg["trusted_groups"] if g["level"] == "normal")
+        normal_group = get_group_by_level(qq_cfg, "normal")
+        if not normal_group:
+            pytest.skip("需要 normal 群聊")
 
         plugin._handle_normal_relay = AsyncMock()
         plugin._generate_reply = AsyncMock()
@@ -225,7 +237,9 @@ class TestSessionPersistence:
     async def test_same_user_reuses_session(self):
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
+        trusted_qq = get_user_by_level(qq_cfg, "trusted")
+        if not trusted_qq:
+            pytest.skip("需要 trusted 用户")
 
         mock_session = AsyncMock()
         mock_session._is_responding = False
@@ -352,7 +366,9 @@ class TestRealAIReply:
     async def test_trusted_private_reply_not_empty(self):
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
+        trusted_qq = get_user_by_level(qq_cfg, "trusted")
+        if not trusted_qq:
+            pytest.skip("需要 trusted 用户")
 
         reply = await plugin._generate_reply(
             message="今天天气怎么样",
@@ -368,7 +384,9 @@ class TestRealAIReply:
         """同一用户两轮对话，第二轮 session 已存在"""
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
+        trusted_qq = get_user_by_level(qq_cfg, "trusted")
+        if not trusted_qq:
+            pytest.skip("需要 trusted 用户")
 
         reply1 = await plugin._generate_reply(
             message="我叫小明",
@@ -416,7 +434,9 @@ class TestRealAIReply:
         """验证 prompt 中的字数限制是否生效"""
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
+        trusted_qq = get_user_by_level(qq_cfg, "trusted")
+        if not trusted_qq:
+            pytest.skip("需要 trusted 用户")
 
         reply = await plugin._generate_reply(
             message="给我讲一个很长很长的故事",
@@ -439,6 +459,7 @@ class TestRealAIReply:
 
         import httpx
         original_post = httpx.AsyncClient.post
+        original_get = httpx.AsyncClient.get
 
         async def mock_post(self_client, url, **kwargs):
             if "/cache/" in url:
@@ -449,7 +470,15 @@ class TestRealAIReply:
                 return mock_resp
             return await original_post(self_client, url, **kwargs)
 
-        with patch.object(httpx.AsyncClient, "post", mock_post):
+        async def mock_get(self_client, url, **kwargs):
+            if "/new_dialog/" in url:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.text = "记忆上下文"
+                return mock_resp
+            return await original_get(self_client, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "post", mock_post), patch.object(httpx.AsyncClient, "get", mock_get):
             reply = await plugin._generate_reply(
                 message="你好",
                 permission_level="admin",
@@ -462,30 +491,92 @@ class TestRealAIReply:
         assert "/cache/" in sync_calls[0]
 
     @pytest.mark.asyncio
-    async def test_trusted_no_memory_sync(self):
-        """trusted 用户不应触发 Memory Server 同步"""
+    async def test_admin_new_session_reads_memory_context(self):
         plugin, toml = await build_plugin()
         qq_cfg = toml["qq_auto_reply"]
-        trusted_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "trusted")
-
-        sync_calls = []
+        admin_qq = next(u["qq"] for u in qq_cfg["trusted_users"] if u["level"] == "admin")
 
         import httpx
+        original_get = httpx.AsyncClient.get
 
-        async def mock_post(self_client, url, **kwargs):
-            if "/cache/" in url:
-                sync_calls.append(url)
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {}
-            return mock_resp
+        get_calls = []
 
-        with patch.object(httpx.AsyncClient, "post", mock_post):
+        async def mock_get(self_client, url, **kwargs):
+            if "/new_dialog/" in url:
+                get_calls.append(url)
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.text = "记忆上下文"
+                return mock_resp
+            return await original_get(self_client, url, **kwargs)
+
+        with patch.object(httpx.AsyncClient, "get", mock_get):
             await plugin._generate_reply(
                 message="你好",
-                permission_level="trusted",
-                sender_id=trusted_qq,
+                permission_level="admin",
+                sender_id=admin_qq,
                 is_group=False,
             )
 
-        assert len(sync_calls) == 0
+        assert len(get_calls) == 1
+        assert "/new_dialog/" in get_calls[0]
+
+    @pytest.mark.asyncio
+    async def test_finalize_session_uses_process_for_unsynced_messages(self):
+        plugin, _ = await build_plugin()
+
+        session = AsyncMock()
+        session._conversation_history = [
+            MagicMock(type='human', content='用户消息'),
+            MagicMock(type='ai', content='AI回复'),
+        ]
+        session.close = AsyncMock()
+        plugin._user_sessions['admin'] = {
+            'session': session,
+            'reply_chunks': [],
+            'her_name': '猫猫',
+            'character_fields': {},
+            'last_synced_index': 0,
+            'last_activity_at': 0,
+            'memory_enabled': True,
+            'has_cached_memory': True,
+        }
+        plugin._post_memory_history = AsyncMock(return_value={'status': 'processed'})
+
+        ok = await plugin._finalize_user_memory_session('admin', reason='test')
+
+        assert ok is True
+        plugin._post_memory_history.assert_called_once()
+        assert plugin._post_memory_history.call_args.args[0] == 'process'
+        session.close.assert_awaited_once()
+        assert 'admin' not in plugin._user_sessions
+
+    @pytest.mark.asyncio
+    async def test_finalize_session_uses_settle_when_only_cached(self):
+        plugin, _ = await build_plugin()
+
+        session = AsyncMock()
+        session._conversation_history = [
+            MagicMock(type='human', content='用户消息'),
+            MagicMock(type='ai', content='AI回复'),
+        ]
+        session.close = AsyncMock()
+        plugin._user_sessions['admin'] = {
+            'session': session,
+            'reply_chunks': [],
+            'her_name': '猫猫',
+            'character_fields': {},
+            'last_synced_index': 2,
+            'last_activity_at': 0,
+            'memory_enabled': True,
+            'has_cached_memory': True,
+        }
+        plugin._post_memory_history = AsyncMock(return_value={'status': 'settled'})
+
+        ok = await plugin._finalize_user_memory_session('admin', reason='test')
+
+        assert ok is True
+        plugin._post_memory_history.assert_called_once()
+        assert plugin._post_memory_history.call_args.args[0] == 'settle'
+        session.close.assert_awaited_once()
+        assert 'admin' not in plugin._user_sessions

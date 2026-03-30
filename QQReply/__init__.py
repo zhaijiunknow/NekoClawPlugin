@@ -13,6 +13,7 @@ import json
 import os
 import random
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from plugin.sdk.plugin import NekoPluginBase, lifecycle, neko_plugin, plugin_entry, Ok, Err, SdkError
@@ -25,6 +26,8 @@ from .group_permission import GroupPermissionManager
 
 @neko_plugin
 class QQAutoReplyPlugin(NekoPluginBase):
+    SESSION_IDLE_TIMEOUT_SECONDS = 300
+    SESSION_SWEEP_INTERVAL_SECONDS = 30
 
     def __init__(self, ctx):
         super().__init__(ctx)
@@ -37,6 +40,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         self._running = False
         self._message_task: Optional[asyncio.Task] = None
+        self._session_housekeeping_task: Optional[asyncio.Task] = None
+        self._user_sessions: dict[str, dict[str, Any]] = {}
 
         # Normal 权限转述功能
         self._admin_qq: Optional[str] = None
@@ -89,6 +94,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.qq_client = QQClient(onebot_url=onebot_url, token=token, logger=self.logger)
         self.logger.info(f"QQ 客户端已初始化: {onebot_url}")
 
+        if self._session_housekeeping_task is None or self._session_housekeeping_task.done():
+            self._session_housekeeping_task = asyncio.create_task(self._session_housekeeping_loop())
 
         return Ok({"status": "running"})
 
@@ -96,6 +103,14 @@ class QQAutoReplyPlugin(NekoPluginBase):
     async def shutdown(self, **_):
         """插件关闭时清理资源"""
         await self.stop_auto_reply()
+        await self._flush_all_memory_sessions(reason="shutdown")
+        if self._session_housekeeping_task:
+            self._session_housekeeping_task.cancel()
+            try:
+                await self._session_housekeeping_task
+            except asyncio.CancelledError:
+                pass
+            self._session_housekeeping_task = None
         if self.qq_client:
             await self.qq_client.disconnect()
 
@@ -181,6 +196,9 @@ class QQAutoReplyPlugin(NekoPluginBase):
         sender_id = message.get("user_id")
         message_text = message.get("content", "")
         user_nickname = message.get("user_nickname")  # QQ 昵称
+
+        if sender_id and sender_id in self._user_sessions:
+            self._user_sessions[sender_id]['last_activity_at'] = time.time()
 
         # 私聊消息处理
         if message_type == "private":
@@ -279,6 +297,127 @@ class QQAutoReplyPlugin(NekoPluginBase):
         # [CQ:at,qq=12345] -> @用户12345
         text = re.sub(r'\[CQ:at,qq=(\d+)\]', r'@用户\1', text)
         return text
+
+    async def _session_housekeeping_loop(self):
+        """定期回收空闲 QQ 会话，并完成正式记忆结算。"""
+        try:
+            while True:
+                await asyncio.sleep(self.SESSION_SWEEP_INTERVAL_SECONDS)
+                await self._flush_idle_memory_sessions()
+        except asyncio.CancelledError:
+            raise
+
+    async def _flush_idle_memory_sessions(self):
+        now = time.time()
+        idle_users = []
+        for sender_id, user_data in list(self._user_sessions.items()):
+            if not user_data.get('memory_enabled'):
+                continue
+            last_activity_at = user_data.get('last_activity_at') or now
+            if now - last_activity_at >= self.SESSION_IDLE_TIMEOUT_SECONDS:
+                idle_users.append(sender_id)
+
+        for sender_id in idle_users:
+            await self._finalize_user_memory_session(sender_id, reason="idle_timeout")
+
+    async def _flush_all_memory_sessions(self, reason: str):
+        for sender_id, user_data in list(self._user_sessions.items()):
+            if user_data.get('memory_enabled'):
+                await self._finalize_user_memory_session(sender_id, reason=reason)
+
+    def _conversation_slice_to_memory_messages(self, conversation_history: list, start_index: int = 0) -> list[dict[str, Any]]:
+        memory_messages = []
+        for msg in conversation_history[start_index:]:
+            msg_type = getattr(msg, 'type', '')
+            if msg_type not in ('human', 'ai'):
+                continue
+            role = 'user' if msg_type == 'human' else 'assistant'
+            content = getattr(msg, 'content', '')
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        parts.append(item.get('text', ''))
+                    elif isinstance(item, str):
+                        parts.append(item)
+                text = ''.join(parts)
+            else:
+                text = str(content)
+            if not text:
+                continue
+            memory_messages.append({
+                'role': role,
+                'content': [{'type': 'text', 'text': text}]
+            })
+        return memory_messages
+
+    async def _post_memory_history(self, endpoint: str, her_name: str, messages: list[dict[str, Any]], timeout: float = 5.0) -> dict[str, Any]:
+        import httpx
+        from config import MEMORY_SERVER_PORT
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"http://localhost:{MEMORY_SERVER_PORT}/{endpoint}/{her_name}",
+                json={'input_history': json.dumps(messages, ensure_ascii=False)},
+                timeout=timeout
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def _cache_session_delta(self, sender_id: str, user_data: dict[str, Any]) -> int:
+        session = user_data.get('session')
+        her_name = user_data.get('her_name')
+        if not session or not her_name:
+            return 0
+        conversation_history = getattr(session, '_conversation_history', []) or []
+        start_index = int(user_data.get('last_synced_index', 0))
+        delta_messages = self._conversation_slice_to_memory_messages(conversation_history, start_index)
+        if not delta_messages:
+            return 0
+        result = await self._post_memory_history('cache', her_name, delta_messages, timeout=5.0)
+        if result.get('status') == 'error':
+            raise RuntimeError(result.get('message', 'cache failed'))
+        user_data['last_synced_index'] = len(conversation_history)
+        user_data['has_cached_memory'] = True
+        return len(delta_messages)
+
+    async def _finalize_user_memory_session(self, sender_id: str, reason: str) -> bool:
+        user_data = self._user_sessions.get(sender_id)
+        if not user_data or not user_data.get('memory_enabled'):
+            return False
+
+        session = user_data.get('session')
+        her_name = user_data.get('her_name')
+        if not session or not her_name:
+            self._user_sessions.pop(sender_id, None)
+            return False
+
+        try:
+            conversation_history = getattr(session, '_conversation_history', []) or []
+            last_synced_index = int(user_data.get('last_synced_index', 0))
+            remaining_messages = self._conversation_slice_to_memory_messages(conversation_history, last_synced_index)
+
+            if remaining_messages:
+                result = await self._post_memory_history('process', her_name, remaining_messages, timeout=30.0)
+                if result.get('status') == 'error':
+                    raise RuntimeError(result.get('message', 'process failed'))
+                self.logger.info(f"[{reason}] 已为用户 {sender_id} 完成正式记忆结算，消息数: {len(remaining_messages)}")
+            elif user_data.get('has_cached_memory'):
+                settled_messages = self._conversation_slice_to_memory_messages(conversation_history, 0)
+                result = await self._post_memory_history('settle', her_name, settled_messages, timeout=30.0)
+                if result.get('status') == 'error':
+                    raise RuntimeError(result.get('message', 'settle failed'))
+                self.logger.info(f"[{reason}] 已为用户 {sender_id} 完成缓存记忆结算")
+
+            await session.close()
+            self._user_sessions.pop(sender_id, None)
+            return True
+        except Exception as e:
+            self.logger.error(f"[{reason}] 用户 {sender_id} 的记忆结算失败: {e}")
+            return False
+
 
     async def _handle_normal_relay(self, message_text: str, sender_id: str, source_type: str, source_id: str):
         """处理 Normal 权限的转述逻辑"""
@@ -500,6 +639,18 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 # 获取用户语言
                 user_language = get_global_language()
 
+                memory_context = ""
+                if not is_group and permission_level == "admin":
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as client:
+                            response = await client.get(f"http://localhost:{MEMORY_SERVER_PORT}/new_dialog/{her_name}")
+                            if response.status_code == 200:
+                                memory_context = response.text.strip()
+                            else:
+                                self.logger.warning(f"读取 Memory Server 上下文失败: {response.status_code}")
+                    except Exception as e:
+                        self.logger.warning(f"读取 Memory Server 上下文失败: {e}")
+
                 # 构建初始提示（与前端一致）
                 init_prompt = SESSION_INIT_PROMPT.get(user_language, SESSION_INIT_PROMPT['zh'])
                 init_prompt = init_prompt.format(name=her_name)
@@ -509,6 +660,9 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     init_prompt,  # "你是一个角色扮演大师。请按要求扮演以下角色（{name}）。"
                     character_prompt  # 角色核心提示词
                 ]
+
+                if memory_context:
+                    system_prompt_parts.append(memory_context)
 
                 # 注入角色卡额外字段
                 if character_card_fields:
@@ -551,7 +705,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     'session': user_session,
                     'reply_chunks': reply_chunks,
                     'her_name': her_name,
-                    'character_fields': character_card_fields
+                    'character_fields': character_card_fields,
+                    'last_synced_index': 0,
+                    'last_activity_at': time.time(),
+                    'memory_enabled': (not is_group and permission_level == "admin"),
+                    'has_cached_memory': False,
                 }
 
             # 获取用户 session
@@ -559,6 +717,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             user_session = user_data['session']
             reply_chunks = user_data['reply_chunks']
             her_name = user_data['her_name']
+            user_data['last_activity_at'] = time.time()
 
             # 清空之前的回复
             reply_chunks.clear()
@@ -577,41 +736,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
             ai_reply = ''.join(reply_chunks).strip()
 
             if ai_reply:
-                # 只有私聊且管理员权限的对话才同步到记忆系统
-                # 群聊消息不进入记忆
-                if not is_group and permission_level == "admin":
+                if user_data.get('memory_enabled'):
                     try:
-                        # 获取 OmniOfflineClient 维护的完整对话历史
-                        conversation_history = user_session._conversation_history
-
-                        # 只同步最新的用户消息和 AI 回复（增量同步）
-                        if len(conversation_history) >= 2:
-                            # 转换为 Memory Server 期望的格式
-                            recent_messages = []
-                            for msg in conversation_history[-2:]:  # 最后两条消息
-                                if hasattr(msg, 'type'):
-                                    role = 'user' if msg.type == 'human' else 'assistant'
-                                    content = msg.content
-                                    recent_messages.append({
-                                        'role': role,
-                                        'content': [{'type': 'text', 'text': content}]
-                                    })
-
-                            # 调用 Memory Server 的 /cache 端点
-                            async with httpx.AsyncClient() as client:
-                                response = await client.post(
-                                    f"http://localhost:{MEMORY_SERVER_PORT}/cache/{her_name}",
-                                    json={'input_history': json.dumps(recent_messages, ensure_ascii=False)},
-                                    timeout=5.0
-                                )
-
-                                if response.status_code == 200:
-                                    result = response.json()
-                                    count = result.get('count', 0)
-                                    self.logger.info(f" [管理员] 成功同步 {count} 条消息到 Memory Server (用户: {sender_id})")
-                                else:
-                                    self.logger.warning(f" Memory Server 返回错误: {response.status_code}")
-
+                        count = await self._cache_session_delta(sender_id, user_data)
+                        if count:
+                            self.logger.info(f"[管理员] 成功同步 {count} 条消息到 Memory Server (用户: {sender_id})")
                     except Exception as e:
                         self.logger.error(f"记忆同步失败: {e}")
                 else:

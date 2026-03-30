@@ -24,9 +24,9 @@ auto_start = true
 onebot_url = "ws://127.0.0.1:3001"
 token = "xK6sBTNuW7y1XDia"
 trusted_users = [
-    { qq = "12344566", level = "admin" },
+    { qq = "820040531", level = "admin" },
 ]
 trusted_groups = [
-    { group_id = "1234455", level = "trusted" },
+    { group_id = "985066274", level = "trusted" },
 ]
 normal_relay_probability = 0.1
