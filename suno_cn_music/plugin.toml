@@ -3,7 +3,7 @@ name = "Suno.cn 音乐生成"
 description = "通过 Suno.cn API 生成 AI 音乐、查询任务、获取歌词等功能"
 version = "1.0.0"
 id = "suno_cn_music"
-entry = "plugin.plugins.suno_cn_music:SunoCnMusicPlugin"
+entry = "plugins.suno_cn_music:SunoCnMusicPlugin"
 
 [plugin.author]
 name = "N.E.K.O Community"

@@ -3,7 +3,7 @@ name = "DG-Lab Hub 控制"
 description = "通过 DG-Lab-Coyote-Game-Hub 的 HTTP API 控制 DG-Lab，支持查询状态、设置强度、设置波形和一键开火。"
 version = "0.1.0"
 id = "dg_lab_hub"
-entry = "plugin.plugins.dg_lab_hub:DGLabHubPlugin"
+entry = "plugins.dg_lab_hub:DGLabHubPlugin"
 
 [plugin.author]
 name = "zhaijiu"

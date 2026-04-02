@@ -3,7 +3,7 @@ name = "剧场模式"
 description = "生成 Galgame 风格剧场场景，并提供独立 UI 与主页面覆盖层联动。"
 version = "0.1.0"
 id = "theatre_mode"
-entry = "plugin.plugins.theatre_mode:TheatrePlugin"
+entry = "plugins.theatre_mode:TheatrePlugin"
 
 [plugin.author]
 name = "Claude"
