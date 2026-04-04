@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import random
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -49,17 +50,19 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         # NapCat 进程管理
         self._napcat_process: Optional[asyncio.subprocess.Process] = None
-        self._napcat_log_task: Optional[asyncio.Task] = None
+        self._napcat_show_window = False
 
     @lifecycle(id="startup")
     async def startup(self, **_):
         """插件启动时初始化"""
         cfg = await self.config.dump(timeout=5.0)
         cfg = cfg if isinstance(cfg, dict) else {}
+        self._cfg = cfg
         qq_cfg = cfg.get("qq_auto_reply", {})
 
-        # 启动 NapCat.Shell
-        await self._start_napcat()
+        # 启动 NapCat.Shell（默认显示控制台窗口）
+        await self._start_napcat(show_window=True)
+        await self._wait_onebot_ready(qq_cfg.get("onebot_url", "ws://127.0.0.1:3001"))
 
         # 初始化权限管理器（优先从 store 加载，回退到 TOML 配置）
         store_users_result = await self.store.get("trusted_users")
@@ -102,7 +105,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
         """插件关闭时清理资源"""
-        await self.stop_auto_reply()
+        await self._stop_auto_reply_runtime(stop_napcat=True)
         await self._flush_all_memory_sessions(reason="shutdown")
         if self._session_housekeeping_task:
             self._session_housekeeping_task.cancel()
@@ -111,14 +114,21 @@ class QQAutoReplyPlugin(NekoPluginBase):
             except asyncio.CancelledError:
                 pass
             self._session_housekeeping_task = None
-        if self.qq_client:
-            await self.qq_client.disconnect()
-
-        # 停止 NapCat.Shell
-        await self._stop_napcat()
 
         self.logger.info("QQ Auto Reply Plugin shutdown")
         return Ok({"status": "shutdown"})
+
+    @plugin_entry(
+        id="enable_auto_reply",
+        name="启用自动回复",
+        description="用户说'启用 QQ 自动回复'、'开启 QQ 自动回复'、'Enable QQ auto-reply'时调用。等价于 start_auto_reply。",
+        input_schema={
+            "type": "object",
+            "properties": {},
+        },
+    )
+    async def enable_auto_reply(self, **_):
+        return await self.start_auto_reply(**_)
 
     @plugin_entry(
         id="start_auto_reply",
@@ -152,6 +162,18 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return Err(SdkError(f"START_ERROR: 启动失败: {e}"))
 
     @plugin_entry(
+        id="disable_auto_reply",
+        name="禁用自动回复",
+        description="用户说'禁用 QQ 自动回复'、'关闭 QQ 自动回复'、'Disable QQ auto-reply'时调用。等价于 stop_auto_reply。",
+        input_schema={
+            "type": "object",
+            "properties": {},
+        },
+    )
+    async def disable_auto_reply(self, **_):
+        return await self.stop_auto_reply(**_)
+
+    @plugin_entry(
         id="stop_auto_reply",
         name="停止自动回复",
         description="stop。停止监听 QQ 消息，断开与 OneBot 服务的连接。用户说'停止'、'关闭'、'停止自动回复'时调用此功能。",
@@ -162,9 +184,14 @@ class QQAutoReplyPlugin(NekoPluginBase):
     )
     async def stop_auto_reply(self, **_):
         """停止自动回复功能"""
-        if not self._running:
+        if not self._running and not self._message_task:
             return Ok({"status": "not_running"})
 
+        await self._stop_auto_reply_runtime(stop_napcat=False)
+        self.logger.info("Auto reply stopped")
+        return Ok({"status": "stopped"})
+
+    async def _stop_auto_reply_runtime(self, *, stop_napcat: bool):
         self._running = False
         if self._message_task:
             self._message_task.cancel()
@@ -174,8 +201,13 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 pass
             self._message_task = None
 
-        self.logger.info("Auto reply stopped")
-        return Ok({"status": "stopped"})
+        if self.qq_client:
+            await self.qq_client.disconnect()
+
+        if stop_napcat and not self._napcat_show_window:
+            await self._stop_napcat()
+        elif stop_napcat:
+            self.logger.info("NapCat was started in foreground mode; skip stopping it")
 
     async def _process_messages(self):
         """处理接收到的 QQ 消息"""
@@ -682,6 +714,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
 - 不要使用 Markdown 格式，不要使用表情符号
 - 记住你是 {her_name}，始终以 {her_name} 的身份回复
 - 在回复中自然地称呼对方为"{user_title}"
+- 注意不要重复之前的发言
 ======环境说明结束======""")
                 else:
                     system_prompt_parts.append(f"""
@@ -691,7 +724,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
 - 请保持角色设定，用简短自然的话回复（不超过50字）
 - 不要使用 Markdown 格式，不要使用表情符号
 - 记住你是 {her_name}，始终以 {her_name} 的身份回复
-- 在回复中自然地称呼对方为"{user_title}"
+- 在回复中自然地称呼对方为"{user_title}“
+- 注意不要重复之前的发言
 ======环境说明结束======""")
 
                 system_prompt = "\n".join(system_prompt_parts)
@@ -1001,32 +1035,9 @@ class QQAutoReplyPlugin(NekoPluginBase):
         groups = self.group_permission_mgr.list_groups()
         return Ok({"groups": groups})
     
-    @plugin_entry(
-        id="start_napcat_foreground",
-        name="前台启动 NapCat",
-        description="用户说'前台启动'、'显示窗口启动'、'手动登录 QQ'时调用。前台启动 NapCat 并显示窗口，用于首次登录 QQ 或需要扫码验证时。",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "show_window": {
-                    "type": "boolean",
-                    "description": "是否显示窗口（true=前台启动，false=后台启动）",
-                    "default": True
-                }
-            }
-        },
-    )
-    async def start_napcat_foreground(self, show_window: bool = True, **_):
-        """前台启动 NapCat（用于登录）"""
-        await self._start_napcat(show_window=show_window)
-        mode = "前台" if show_window else "后台"
-        return Ok({
-            "status": "started",
-            "mode": mode,
-            "message": f"NapCat 已{mode}启动，请在弹出的窗口中登录 QQ" if show_window else f"NapCat 已{mode}启动"
-        })
+   
 
-    async def _start_napcat(self, show_window: bool = False):
+    async def _start_napcat(self, show_window: bool = True):
         """启动 NapCat
 
         Args:
@@ -1043,64 +1054,64 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 return
 
             mode = "前台" if show_window else "后台"
+            self._napcat_show_window = show_window
             self.logger.info(f"Starting NapCat ({mode}模式) from {napcat_dir}")
 
             # 根据参数决定是否显示窗口
             if show_window:
-                # 前台启动：直接运行 launcher.bat，显示窗口（用于登录）
+                # 前台启动：强制通过 cmd 打开独立控制台窗口运行 launcher.bat
+                creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
                 self._napcat_process = await asyncio.create_subprocess_exec(
-                    str(launcher_script),
+                    "cmd", "/k", str(launcher_script),
                     cwd=str(napcat_dir),
+                    creationflags=creationflags,
                 )
             else:
-                # 后台启动：隐藏窗口但保持 PIPE 输出
+                # 后台启动：隐藏窗口并丢弃控制台输出
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
                 self._napcat_process = await asyncio.create_subprocess_exec(
                     "cmd", "/c", str(launcher_script),
                     cwd=str(napcat_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
                     startupinfo=startupinfo,
                 )
 
             self.logger.info(f" NapCat started ({mode}模式, PID: {self._napcat_process.pid if self._napcat_process else 'N/A'})")
 
-            # 启动输出捕获任务（仅后台模式有 PIPE）
-            if not show_window and self._napcat_process:
-                self._napcat_log_task = asyncio.create_task(self._pipe_napcat_output())
-
-            # 等待 NapCat 启动（给它一些时间初始化）
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
         except Exception as e:
             self.logger.error(f"Failed to start NapCat: {e}")
 
-    async def _pipe_napcat_output(self):
-        """持续读取 NapCat 的 stdout/stderr 并写入插件日志"""
-        proc = self._napcat_process
-        if not proc:
-            return
+    async def _wait_onebot_ready(self, onebot_url: str, timeout: float = 30.0) -> None:
+        host, port = self._parse_onebot_host_port(onebot_url)
+        deadline = time.monotonic() + timeout
+        last_error: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=1.0):
+                    self.logger.info(f"OneBot endpoint is ready: {host}:{port}")
+                    return
+            except OSError as e:
+                last_error = e
+                await asyncio.sleep(1)
+        raise RuntimeError(f"OneBot endpoint not ready at {host}:{port}: {last_error}")
 
-        async def read_stream(stream, prefix: str):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    self.logger.info(f"[NapCat] {prefix}{text}")
-
-        try:
-            await asyncio.gather(
-                read_stream(proc.stdout, ""),
-                read_stream(proc.stderr, "[ERR] "),
-            )
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            self.logger.error(f"NapCat output pipe error: {e}")
+    def _parse_onebot_host_port(self, onebot_url: str) -> tuple[str, int]:
+        raw = (onebot_url or "").strip()
+        if raw.startswith(("ws://", "wss://", "http://", "https://")):
+            raw = raw.split("://", 1)[1]
+        raw = raw.split("/", 1)[0]
+        if ":" in raw:
+            host, port_text = raw.rsplit(":", 1)
+            try:
+                return host or "127.0.0.1", int(port_text)
+            except ValueError:
+                pass
+        return "127.0.0.1", 3001
 
 
     @plugin_entry(
@@ -1113,7 +1124,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     )
     async def stop_napcat(self, **_):
         """停止 NapCat"""
-        await self._stop_napcat()
+        await self._stop_auto_reply_runtime(stop_napcat=True)
         return Ok({"status": "stopped"})
 
     async def _stop_napcat(self):

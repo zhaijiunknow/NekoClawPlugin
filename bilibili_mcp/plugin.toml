@@ -1,0 +1,23 @@
+[plugin]
+name = "Bilibili MCP"
+description = "原生 N.E.K.O B 站插件，直接使用 bilibili_api 提供登录、搜索、热门、评论、动态和私信能力。"
+version = "0.1.0"
+id = "bilibili_mcp"
+entry = "plugins.bilibili_mcp:BilibiliMCPPlugin"
+
+[plugin.author]
+name = "ZhaiJiu"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[plugin.store]
+enabled = false
+
+[bilibili_mcp.env]
+PYTHONIOENCODING = "utf-8"

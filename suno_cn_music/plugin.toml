@@ -6,7 +6,7 @@ id = "suno_cn_music"
 entry = "plugins.suno_cn_music:SunoCnMusicPlugin"
 
 [plugin.author]
-name = "N.E.K.O Community"
+name = "ZhaiJiu"
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"

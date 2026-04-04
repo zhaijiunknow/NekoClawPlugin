@@ -6,7 +6,7 @@ id = "dg_lab_hub"
 entry = "plugins.dg_lab_hub:DGLabHubPlugin"
 
 [plugin.author]
-name = "zhaijiu"
+name = "ZhaiJiu"
 
 [plugin.sdk]
 recommended = ">=0.1.0,<0.2.0"
