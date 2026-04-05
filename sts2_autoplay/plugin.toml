@@ -1,0 +1,34 @@
+[plugin]
+name = "STS2 自动游玩"
+description = "连接本地 STS2-Agent 服务，读取《Slay the Spire 2》局面并执行自动游玩控制。"
+version = "0.1.0"
+id = "sts2_autoplay"
+type = "plugin"
+entry = "plugins.sts2_autoplay:STS2AutoplayPlugin"
+
+[plugin.author]
+name = "Claude"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[plugin.store]
+enabled = false
+
+[sts2]
+base_url = "http://127.0.0.1:8080"
+connect_timeout_seconds = 5
+request_timeout_seconds = 15
+poll_interval_idle_seconds = 3
+poll_interval_active_seconds = 1
+post_action_delay_seconds = 0.5
+autoplay_on_start = false
+strategy = "heuristic"
+max_consecutive_errors = 3
+push_notifications = false
+event_stream_enabled = false

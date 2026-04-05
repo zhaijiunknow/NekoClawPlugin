@@ -53,6 +53,32 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self._napcat_show_window = False
         self._napcat_log_task: Optional[asyncio.Task] = None
 
+    def _refresh_admin_qq(self) -> None:
+        self._admin_qq = None
+        if not self.permission_mgr:
+            return
+        for user in self.permission_mgr.list_users():
+            if user.get("level") == "admin":
+                qq = str(user.get("qq") or "").strip()
+                if qq:
+                    self._admin_qq = qq
+                    return
+
+    @staticmethod
+    def _build_session_key(*, sender_id: str, is_group: bool, group_id: Optional[str] = None) -> str:
+        sender = str(sender_id or "").strip()
+        if is_group:
+            return f"group:{str(group_id or '').strip()}:{sender}"
+        return f"private:{sender}"
+
+    async def _wait_session_response_complete(self, session: Any, timeout: float = 30.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            if not getattr(session, "_is_responding", False):
+                return True
+        return False
+
     @lifecycle(id="startup")
     async def startup(self, **_):
         """插件启动时初始化"""
@@ -80,10 +106,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.group_permission_mgr = GroupPermissionManager(trusted_groups)
 
         # 获取管理员 QQ（用于转述）
-        for user in trusted_users:
-            if user.get("level") == "admin":
-                self._admin_qq = user.get("qq")
-                break
+        self._refresh_admin_qq()
 
         # 获取转述概率
         self._normal_relay_probability = qq_cfg.get("normal_relay_probability", 0.1)
@@ -179,10 +202,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if self.qq_client:
             await self.qq_client.disconnect()
 
-        if stop_napcat and not self._napcat_show_window:
+        if stop_napcat:
             await self._stop_napcat()
-        elif stop_napcat:
-            self.logger.info("NapCat was started in foreground mode; skip stopping it")
 
     async def _process_messages(self):
         """处理接收到的 QQ 消息"""
@@ -200,21 +221,22 @@ class QQAutoReplyPlugin(NekoPluginBase):
     async def _handle_message(self, message: Dict[str, Any]):
         """处理单条消息，通过 OneBot API 回复"""
         message_type = message.get("message_type")
-        sender_id = message.get("user_id")
+        sender_id = str(message.get("user_id") or "").strip()
         message_text = message.get("content", "")
         user_nickname = message.get("user_nickname")  # QQ 昵称
 
-        if sender_id and sender_id in self._user_sessions:
-            self._user_sessions[sender_id]['last_activity_at'] = time.time()
-
-        # 私聊消息处理
         if message_type == "private":
+            session_key = self._build_session_key(sender_id=sender_id, is_group=False)
+            if session_key in self._user_sessions:
+                self._user_sessions[session_key]['last_activity_at'] = time.time()
             await self._handle_private_message(sender_id, message_text, user_nickname)
 
-        # 群聊消息处理
         elif message_type == "group":
-            group_id = message.get("group_id")
+            group_id = str(message.get("group_id") or "").strip()
             is_at_bot = message.get("is_at_bot", False)
+            session_key = self._build_session_key(sender_id=sender_id, is_group=True, group_id=group_id)
+            if session_key in self._user_sessions:
+                self._user_sessions[session_key]['last_activity_at'] = time.time()
             await self._handle_group_message(group_id, sender_id, message_text, is_at_bot, user_nickname)
 
     async def _handle_private_message(self, sender_id: str, message_text: str, user_nickname: Optional[str] = None):
@@ -226,7 +248,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return
 
         self.logger.info(
-            f"Received private message from {sender_id} (level: {permission_level}): {message_text}"
+            f"Received private message from {sender_id} (level: {permission_level}, length: {len(message_text)})"
         )
 
         # Normal 权限：不直接回复，概率转述给管理员
@@ -249,7 +271,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if reply_text:
             try:
                 await self.qq_client.send_message(sender_id, reply_text)
-                self.logger.info(f"Sent reply to {sender_id}: {reply_text}")
+                self.logger.info(f"Sent reply to {sender_id} (length: {len(reply_text)})")
             except Exception as e:
                 self.logger.error(f"Failed to send message via OneBot: {e}")
 
@@ -262,7 +284,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return
 
         self.logger.info(
-            f"Received group message from group {group_id}, user {sender_id} (group level: {group_level}): {message_text}"
+            f"Received group message from group {group_id}, user {sender_id} (group level: {group_level}, length: {len(message_text)})"
         )
 
         # Normal 群聊：不响应 @，概率转述给管理员
@@ -291,7 +313,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if reply_text:
             try:
                 await self.qq_client.send_group_message(group_id, reply_text)
-                self.logger.info(f"Sent group reply to {group_id}: {reply_text}")
+                self.logger.info(f"Sent group reply to {group_id} (length: {len(reply_text)})")
             except Exception as e:
                 self.logger.error(f"Failed to send group message via OneBot: {e}")
 
@@ -521,20 +543,19 @@ class QQAutoReplyPlugin(NekoPluginBase):
             relay_prompt = f"请把这个内容转述给{master_name if master_name else '主人'}：{message_text}"
             await temp_session.stream_text(relay_prompt)
 
-            # 等待回复完成
-            for i in range(30):
-                await asyncio.sleep(1)
-                if not temp_session._is_responding:
-                    break
+            completed = await self._wait_session_response_complete(temp_session)
+            if not completed:
+                self.logger.warning("Relay generation timed out; closing temporary session")
+                await temp_session.close()
+                return
 
-            # 组合回复
             relay_text = ''.join(reply_chunks).strip()
 
             if relay_text:
                 # 发送给管理员
                 try:
                     await self.qq_client.send_message(self._admin_qq, relay_text)
-                    self.logger.info(f"Relayed to admin {self._admin_qq}: {relay_text[:50]}...")
+                    self.logger.info(f"Relayed to admin {self._admin_qq} (length: {len(relay_text)})")
                 except Exception as e:
                     self.logger.error(f"Failed to relay to admin: {e}")
 
@@ -621,9 +642,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
             if not hasattr(self, '_user_sessions'):
                 self._user_sessions = {}
 
-            # 获取或创建用户的 session
-            if sender_id not in self._user_sessions:
-                self.logger.info(f"为用户 {sender_id} 创建新的对话 session")
+            session_key = self._build_session_key(sender_id=sender_id, is_group=is_group, group_id=group_id)
+
+            if session_key not in self._user_sessions:
+                self.logger.info(f"为会话 {session_key} 创建新的对话 session")
 
                 # 创建回复收集器
                 reply_chunks = []
@@ -710,7 +732,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
                 await user_session.connect(instructions=system_prompt)
 
-                self._user_sessions[sender_id] = {
+                self._user_sessions[session_key] = {
                     'session': user_session,
                     'reply_chunks': reply_chunks,
                     'her_name': her_name,
@@ -722,34 +744,32 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 }
 
             # 获取用户 session
-            user_data = self._user_sessions[sender_id]
+            user_data = self._user_sessions[session_key]
             user_session = user_data['session']
             reply_chunks = user_data['reply_chunks']
             her_name = user_data['her_name']
             user_data['last_activity_at'] = time.time()
 
-            # 清空之前的回复
             reply_chunks.clear()
 
-            # 发送消息到 AI（通过 OmniOfflineClient.stream_text）
-            self.logger.info(f"发送消息到 AI: {message[:50]}...")
+            self.logger.info(f"发送消息到 AI (会话: {session_key}, length: {len(message)})")
             await user_session.stream_text(message)
 
-            # 等待回复完成
-            for i in range(30):
-                await asyncio.sleep(1)
-                if not user_session._is_responding:
-                    break
+            completed = await self._wait_session_response_complete(user_session)
+            if not completed:
+                self.logger.warning(f"会话 {session_key} 响应超时，关闭并丢弃该会话")
+                await user_session.close()
+                self._user_sessions.pop(session_key, None)
+                return None
 
-            # 组合回复
             ai_reply = ''.join(reply_chunks).strip()
 
             if ai_reply:
                 if user_data.get('memory_enabled'):
                     try:
-                        count = await self._cache_session_delta(sender_id, user_data)
+                        count = await self._cache_session_delta(session_key, user_data)
                         if count:
-                            self.logger.info(f"[管理员] 成功同步 {count} 条消息到 Memory Server (用户: {sender_id})")
+                            self.logger.info(f"[管理员] 成功同步 {count} 条消息到 Memory Server (会话: {session_key})")
                     except Exception as e:
                         self.logger.error(f"记忆同步失败: {e}")
                 else:
@@ -758,7 +778,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     else:
                         self.logger.info(f"[非管理员] 跳过记忆同步 (用户: {sender_id}, 权限: {permission_level})")
 
-                self.logger.info(f"AI 生成回复: {ai_reply[:50]}...")
+                self.logger.info(f"AI 生成回复完成 (会话: {session_key}, length: {len(ai_reply)})")
                 return ai_reply
             else:
                 self.logger.warning("AI 未生成回复")
@@ -825,6 +845,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         # 添加到内存（管理员不设置昵称）
         user_nickname = "" if level == "admin" else nickname
         self.permission_mgr.add_user(qq_number, level, user_nickname)
+        self._refresh_admin_qq()
         self.logger.info(f"Added trusted user: {qq_number} with level {level}" +
                         (f" and nickname {user_nickname}" if user_nickname else ""))
 
@@ -863,6 +884,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
 
         self.permission_mgr.remove_user(qq_number)
+        self._refresh_admin_qq()
         self.logger.info(f"Removed trusted user: {qq_number}")
 
         success = await self._save_trusted_users_to_config()
@@ -998,9 +1020,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 self.logger.warning(f"NapCat launcher not found: {launcher_script}")
                 return
 
-            mode = "前台" if show_window else "后台"
-            self._napcat_show_window = show_window
             self.logger.info(f"Starting NapCat ({mode}模式) from {napcat_dir}")
+
+            if self._napcat_process and self._napcat_process.returncode is None:
+                self.logger.info("NapCat process already running")
+                return
 
             # 根据参数决定是否显示窗口
             if show_window:
@@ -1026,7 +1050,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
             self.logger.info(f" NapCat started ({mode}模式, PID: {self._napcat_process.pid if self._napcat_process else 'N/A'})")
 
-            await asyncio.sleep(2)
+            onebot_url = str((self._cfg.get("qq_auto_reply", {}) or {}).get("onebot_url", "ws://127.0.0.1:3001"))
+            await self._wait_onebot_ready(onebot_url)
 
         except Exception as e:
             self.logger.error(f"Failed to start NapCat: {e}")
@@ -1077,7 +1102,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     async def start_qq_server(self, show_window: bool = True, **_):
         """开启 QQ 服务器"""
         await self._start_napcat(show_window=show_window)
-        return Ok({"status": "started", "show_window": bool(show_window)})
+        return Ok({"status": "started", "show_window": bool(show_window), "ready": True})
 
     @plugin_entry(
         id="stop_qq_server",
