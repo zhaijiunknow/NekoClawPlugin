@@ -51,6 +51,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         # NapCat 进程管理
         self._napcat_process: Optional[asyncio.subprocess.Process] = None
         self._napcat_show_window = False
+        self._napcat_log_task: Optional[asyncio.Task] = None
 
     @lifecycle(id="startup")
     async def startup(self, **_):
@@ -59,10 +60,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
         cfg = cfg if isinstance(cfg, dict) else {}
         self._cfg = cfg
         qq_cfg = cfg.get("qq_auto_reply", {})
-
-        # 启动 NapCat.Shell（默认显示控制台窗口）
-        await self._start_napcat(show_window=True)
-        await self._wait_onebot_ready(qq_cfg.get("onebot_url", "ws://127.0.0.1:3001"))
 
         # 初始化权限管理器（优先从 store 加载，回退到 TOML 配置）
         store_users_result = await self.store.get("trusted_users")
@@ -97,6 +94,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.qq_client = QQClient(onebot_url=onebot_url, token=token, logger=self.logger)
         self.logger.info(f"QQ 客户端已初始化: {onebot_url}")
 
+        await self._start_napcat(show_window=True)
+
         if self._session_housekeeping_task is None or self._session_housekeeping_task.done():
             self._session_housekeeping_task = asyncio.create_task(self._session_housekeeping_loop())
 
@@ -117,18 +116,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         self.logger.info("QQ Auto Reply Plugin shutdown")
         return Ok({"status": "shutdown"})
-
-    @plugin_entry(
-        id="enable_auto_reply",
-        name="启用自动回复",
-        description="用户说'启用 QQ 自动回复'、'开启 QQ 自动回复'、'Enable QQ auto-reply'时调用。等价于 start_auto_reply。",
-        input_schema={
-            "type": "object",
-            "properties": {},
-        },
-    )
-    async def enable_auto_reply(self, **_):
-        return await self.start_auto_reply(**_)
 
     @plugin_entry(
         id="start_auto_reply",
@@ -160,18 +147,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.exception("Failed to start auto reply")
             return Err(SdkError(f"START_ERROR: 启动失败: {e}"))
-
-    @plugin_entry(
-        id="disable_auto_reply",
-        name="禁用自动回复",
-        description="用户说'禁用 QQ 自动回复'、'关闭 QQ 自动回复'、'Disable QQ auto-reply'时调用。等价于 stop_auto_reply。",
-        input_schema={
-            "type": "object",
-            "properties": {},
-        },
-    )
-    async def disable_auto_reply(self, **_):
-        return await self.stop_auto_reply(**_)
 
     @plugin_entry(
         id="stop_auto_reply",
@@ -897,20 +872,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
         return Ok(result)
 
     @plugin_entry(
-        id="list_trusted_users",
-        name="列出信任用户",
-        description="【用户管理】列出所有信任用户及其权限等级。用户说'列出用户'、'查看用户列表'时调用。",
-        input_schema={"type": "object", "properties": {}},
-    )
-    async def list_trusted_users(self, **_):
-        """列出所有信任用户"""
-        if not self.permission_mgr:
-            return Err(SdkError("NOT_INITIALIZED: 权限管理器未初始化"))
-
-        users = self.permission_mgr.list_users()
-        return Ok({"users": users})
-
-    @plugin_entry(
         id="set_user_nickname",
         name="设置用户昵称",
         description="【用户管理】为信任用户设置专属称呼。管理员始终被称为主人，其他用户可以设置自定义昵称。用户说'设置昵称'、'修改昵称'时调用。",
@@ -1021,22 +982,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
             result["warning"] = "已从内存移除，但持久化失败"
         return Ok(result)
 
-    @plugin_entry(
-        id="list_trusted_groups",
-        name="列出信任群聊",
-        description="【群聊管理】列出所有信任群聊及其权限等级。用户说'列出群聊'、'查看群聊列表'时调用。",
-        input_schema={"type": "object", "properties": {}},
-    )
-    async def list_trusted_groups(self, **_):
-        """列出所有信任群聊"""
-        if not self.group_permission_mgr:
-            return Err(SdkError("NOT_INITIALIZED: 群聊权限管理器未初始化"))
-
-        groups = self.group_permission_mgr.list_groups()
-        return Ok({"groups": groups})
-    
-   
-
     async def _start_napcat(self, show_window: bool = True):
         """启动 NapCat
 
@@ -1115,15 +1060,35 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
 
     @plugin_entry(
-        id="stop_napcat",
-        name="停止 NapCat",
-        description="用户说'停止 NapCat'、'关闭 NapCat'时调用。停止 NapCat 进程并断开连接。",
+        id="start_qq_server",
+        name="开启QQ服务器",
+        description="用户说'开启QQ服务器'、'启动QQ服务器'、'打开QQ服务器'时调用。开启 QQ 服务器（NapCat.Shell / OneBot），但不会自动启用 QQ 自动回复。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "show_window": {
+                    "type": "boolean",
+                    "description": "是否显示窗口。true=前台启动，false=后台启动",
+                    "default": True
+                }
+            }
+        },
+    )
+    async def start_qq_server(self, show_window: bool = True, **_):
+        """开启 QQ 服务器"""
+        await self._start_napcat(show_window=show_window)
+        return Ok({"status": "started", "show_window": bool(show_window)})
+
+    @plugin_entry(
+        id="stop_qq_server",
+        name="关闭QQ服务器",
+        description="用户说'关闭QQ服务器'、'停止QQ服务器'、'关闭 NapCat'时调用。关闭 QQ 服务器并断开连接。",
         input_schema={
             "type": "object",
         },
     )
-    async def stop_napcat(self, **_):
-        """停止 NapCat"""
+    async def stop_qq_server(self, **_):
+        """关闭 QQ 服务器"""
         await self._stop_auto_reply_runtime(stop_napcat=True)
         return Ok({"status": "stopped"})
 
