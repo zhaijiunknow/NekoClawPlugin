@@ -97,12 +97,6 @@ normal_relay_probability = 0.1
 
 ## 使用教程
 
-### 0. 插件位置
-
-```
-C:\Users\"Users"\Documents\N.E.K.O\plugins\qq_auto_reply
-```
-
 ### 1. 启动方式
 
 启动顺序如下：
@@ -110,7 +104,8 @@ C:\Users\"Users"\Documents\N.E.K.O\plugins\qq_auto_reply
 1. 在插件管理面板手动启动 `qq_auto_reply`
 2. 插件初始化权限管理器和 QQ 客户端
 3. 插件自动在前台启动 NapCat
-4. 调用“启动自动回复”开始监听 QQ 消息
+4. 在NapCat的网络配置处设置`WS服务器`并把数据写入`plugin.toml`
+5. 调用“启动自动回复”开始监听 QQ 消息
 
 **注意事项：**
 - 登录成功后，确保 NapCat 的 OneBot 服务已启动，再启用自动回复
