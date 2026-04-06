@@ -9,10 +9,10 @@ def normalize_actions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     for item in actions:
         if not isinstance(item, dict):
             continue
-        action_type = item.get("type") or item.get("action") or "unknown"
+        action_type = item.get("type") or item.get("action") or item.get("name") or "unknown"
         normalized.append({
             "type": str(action_type),
-            "label": str(item.get("label") or item.get("description") or action_type),
+            "label": str(item.get("label") or item.get("description") or item.get("name") or action_type),
             "raw": item,
         })
     return normalized

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, Optional
 
 from .client import STS2ApiClient, STS2ClientError
 from .models import normalize_snapshot
 
 
 class STS2AutoplayService:
-    def __init__(self, logger, status_reporter: Callable[[dict[str, Any]], None]) -> None:
+    def __init__(self, logger, status_reporter: Callable[[dict[str, Any]], None], frontend_notifier: Optional[Callable[..., Any]] = None) -> None:
         self.logger = logger
         self._report_status = status_reporter
+        self._frontend_notifier = frontend_notifier
         self._client: Optional[STS2ApiClient] = None
         self._cfg: Dict[str, Any] = {}
         self._snapshot: Dict[str, Any] = {}
@@ -28,6 +30,7 @@ class STS2AutoplayService:
         self._last_poll_at = 0.0
         self._last_action_at = 0.0
         self._consecutive_errors = 0
+        self._step_lock = asyncio.Lock()
 
     async def startup(self, cfg: Dict[str, Any]) -> None:
         self._cfg = dict(cfg)
@@ -54,6 +57,8 @@ class STS2AutoplayService:
             self._poll_task.cancel()
             try:
                 await self._poll_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             self._poll_task = None
@@ -72,16 +77,8 @@ class STS2AutoplayService:
         return {"status": "connected", "message": f"STS2-Agent 已连接: {client.base_url}", "health": data}
 
     async def refresh_state(self) -> Dict[str, Any]:
-        client = self._require_client()
-        state_payload = await client.get_state()
-        actions_payload = await client.get_available_actions()
-        self._snapshot = normalize_snapshot(state_payload, actions_payload)
-        self._server_state = "connected"
-        self._last_error = ""
-        self._last_poll_at = time.time()
-        self._history.appendleft({"type": "snapshot", "time": self._last_poll_at, "screen": self._snapshot.get("screen"), "available_actions": self._snapshot.get("available_action_count", 0)})
-        self._emit_status()
-        return {"status": "ok", "message": f"已刷新状态，screen={self._snapshot.get('screen')}", "snapshot": self._snapshot}
+        context = await self._fetch_step_context(publish=True, record_history=True)
+        return {"status": "ok", "message": f"已刷新状态，screen={self._snapshot.get('screen')}", "snapshot": context["snapshot"]}
 
     async def get_status(self) -> Dict[str, Any]:
         return {
@@ -104,16 +101,229 @@ class STS2AutoplayService:
         return {"status": "ok", "message": "当前快照", "snapshot": self._snapshot}
 
     async def step_once(self) -> Dict[str, Any]:
-        if not self._snapshot:
-            await self.refresh_state()
-        actions = self._snapshot.get("available_actions") if isinstance(self._snapshot.get("available_actions"), list) else []
+        async with self._step_lock:
+            return await self._step_once_locked()
+
+    async def _step_once_locked(self) -> Dict[str, Any]:
+        context = await self._await_stable_step_context()
+        actions = context["actions"]
         if not actions:
-            return {"status": "idle", "message": "当前没有可执行动作", "snapshot": self._snapshot}
+            snapshot = context["snapshot"]
+            return {"status": "idle", "message": "当前没有可执行动作", "snapshot": snapshot}
         action = self._select_action(actions)
-        result = await self._execute_action(action)
-        await asyncio.sleep(float(self._cfg.get("post_action_delay_seconds", 0.5) or 0.5))
-        await self.refresh_state()
-        return result
+        prepared = self._prepare_action_request(action, context)
+        revalidated = await self._revalidate_prepared_action(prepared, context)
+        if revalidated is None:
+            context = await self._await_stable_step_context()
+            actions = context["actions"]
+            if not actions:
+                snapshot = context["snapshot"]
+                return {"status": "idle", "message": "当前没有可执行动作", "snapshot": snapshot}
+            action = self._select_action(actions)
+            prepared = self._prepare_action_request(action, context)
+        result = await self._execute_action(prepared)
+        await self._maybe_emit_frontend_message(
+            event_type="action",
+            action=prepared.get("action_type"),
+            snapshot=context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {},
+            detail=result.get("message") or "",
+        )
+        await self._await_action_interval()
+        settled_context = await self._await_post_action_settle(context, prepared)
+        self._publish_snapshot(settled_context["snapshot"], record_history=True)
+        return {**result, "snapshot": settled_context["snapshot"]}
+
+    def _publish_snapshot(self, snapshot: Dict[str, Any], *, record_history: bool) -> Dict[str, Any]:
+        self._snapshot = snapshot
+        self._server_state = "connected"
+        self._last_error = ""
+        self._last_poll_at = time.time()
+        if record_history:
+            self._history.appendleft({
+                "type": "snapshot",
+                "time": self._last_poll_at,
+                "screen": self._snapshot.get("screen"),
+                "available_actions": self._snapshot.get("available_action_count", 0),
+            })
+        self._emit_status()
+        return snapshot
+
+    async def _fetch_step_context(self, *, publish: bool = False, record_history: bool = False) -> Dict[str, Any]:
+        client = self._require_client()
+        state_payload = await client.get_state()
+        actions_payload = await client.get_available_actions()
+        snapshot = normalize_snapshot(state_payload, actions_payload)
+        if publish:
+            self._publish_snapshot(snapshot, record_history=record_history)
+        return {
+            "snapshot": snapshot,
+            "actions": snapshot.get("available_actions") if isinstance(snapshot.get("available_actions"), list) else [],
+            "signature": self._snapshot_signature(snapshot),
+            "action_signature": self._action_signature(snapshot),
+            "state_signature": self._state_signature(snapshot),
+            "captured_at": time.time(),
+        }
+
+    def _snapshot_signature(self, snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            snapshot.get("screen"),
+            snapshot.get("floor"),
+            snapshot.get("act"),
+            bool(snapshot.get("in_combat", False)),
+            snapshot.get("available_action_count", 0),
+            self._action_signature(snapshot),
+            self._state_signature(snapshot),
+        )
+
+    def _action_signature(self, snapshot: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+        actions = snapshot.get("available_actions") if isinstance(snapshot.get("available_actions"), list) else []
+        return tuple(self._action_fingerprint(action) for action in actions if isinstance(action, dict))
+
+    def _action_fingerprint(self, action: dict[str, Any]) -> tuple[Any, ...]:
+        raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+        return (
+            str(action.get("type") or raw.get("type") or raw.get("name") or raw.get("action") or ""),
+            raw.get("option_index"),
+            raw.get("index"),
+            raw.get("card_index"),
+            raw.get("target_index"),
+            raw.get("name"),
+        )
+
+    def _state_signature(self, snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        combat = raw_state.get("combat") if isinstance(raw_state.get("combat"), dict) else {}
+        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        potions = run.get("potions") if isinstance(run.get("potions"), list) else []
+        hand_signature = tuple(
+            (
+                card.get("index"),
+                card.get("uuid"),
+                card.get("id"),
+                card.get("name"),
+                bool(card.get("playable")),
+                tuple(card.get("valid_target_indices")) if isinstance(card.get("valid_target_indices"), list) else (),
+            )
+            for card in hand
+            if isinstance(card, dict)
+        )
+        potion_signature = tuple(
+            (
+                potion.get("index"),
+                potion.get("id"),
+                potion.get("name"),
+                bool(potion.get("can_use")),
+                bool(potion.get("can_discard")),
+            )
+            for potion in potions
+            if isinstance(potion, dict)
+        )
+        return (
+            raw_state.get("screen"),
+            raw_state.get("screen_type"),
+            raw_state.get("floor"),
+            raw_state.get("act_floor"),
+            raw_state.get("act"),
+            raw_state.get("turn"),
+            raw_state.get("turn_count"),
+            raw_state.get("phase"),
+            bool(raw_state.get("in_combat", False)),
+            combat.get("turn"),
+            combat.get("turn_count"),
+            combat.get("player_energy"),
+            combat.get("end_turn_available"),
+            hand_signature,
+            potion_signature,
+        )
+
+    def _is_actionable_context(self, context: dict[str, Any]) -> bool:
+        return bool(context["actions"])
+
+    def _is_transitional_context(self, context: dict[str, Any]) -> bool:
+        snapshot = context["snapshot"]
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        screen = self._normalized_screen_name(snapshot)
+        in_combat = bool(snapshot.get("in_combat", False) or raw_state.get("in_combat", False))
+        if context["actions"]:
+            return False
+        if in_combat:
+            return screen == "combat"
+        return self._is_eventish_screen(screen)
+
+    def _normalized_screen_name(self, snapshot: dict[str, Any]) -> str:
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        screen = snapshot.get("screen") or raw_state.get("screen") or raw_state.get("screen_type") or ""
+        return str(screen).strip().lower()
+
+    def _is_eventish_screen(self, screen: str) -> bool:
+        normalized = (screen or "").strip().lower()
+        if not normalized:
+            return False
+        return any(keyword in normalized for keyword in {"event", "modal", "overlay", "dialog", "choice"})
+
+    async def _await_stable_step_context(self) -> Dict[str, Any]:
+        attempts = max(2, int(self._cfg.get("stable_state_attempts", 4) or 4))
+        delay = max(0.1, float(self._cfg.get("poll_interval_active_seconds", 1) or 1) / 2)
+        previous: Optional[Dict[str, Any]] = None
+        last_context: Optional[Dict[str, Any]] = None
+        for attempt in range(attempts):
+            context = await self._fetch_step_context(publish=(attempt == 0), record_history=(attempt == 0))
+            last_context = context
+            if previous is not None and context["signature"] == previous["signature"]:
+                return context
+            if self._is_actionable_context(context) and not self._is_transitional_context(context):
+                return context
+            if not self._is_transitional_context(context) and attempt == attempts - 1:
+                return context
+            previous = context
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return last_context or await self._fetch_step_context(publish=True, record_history=True)
+
+    def _prepare_action_request(self, action: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+        raw_action = raw.get("action")
+        action_type = str(action.get("type") or raw.get("type") or (raw_action if isinstance(raw_action, str) else ""))
+        kwargs = self._normalize_action_kwargs(action_type, raw, context)
+        return {
+            "action": action,
+            "action_type": action_type,
+            "kwargs": kwargs,
+            "fingerprint": self._action_fingerprint(action),
+            "context_signature": context["signature"],
+        }
+
+    async def _revalidate_prepared_action(self, prepared: dict[str, Any], context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        actions = context["actions"]
+        if not any(self._action_fingerprint(action) == prepared["fingerprint"] for action in actions if isinstance(action, dict)):
+            return None
+        latest = await self._fetch_step_context()
+        if any(self._action_fingerprint(action) == prepared["fingerprint"] for action in latest["actions"] if isinstance(action, dict)):
+            return prepared
+        return None
+
+    async def _await_action_interval(self) -> None:
+        delay = max(0.0, float(self._cfg.get("action_interval_seconds", 0.5) or 0.5))
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _await_post_action_settle(self, before_context: dict[str, Any], prepared: dict[str, Any]) -> Dict[str, Any]:
+        attempts = max(2, int(self._cfg.get("post_action_settle_attempts", 6) or 6))
+        delay = max(0.1, float(self._cfg.get("post_action_delay_seconds", 0.5) or 0.5))
+        last_context = before_context
+        for attempt in range(attempts):
+            if attempt > 0:
+                await asyncio.sleep(delay)
+            context = await self._fetch_step_context()
+            last_context = context
+            if context["signature"] != before_context["signature"]:
+                if not self._is_transitional_context(context):
+                    return context
+                continue
+            if not any(self._action_fingerprint(action) == prepared["fingerprint"] for action in context["actions"] if isinstance(action, dict)):
+                return context
+        return last_context
 
     async def start_autoplay(self) -> Dict[str, Any]:
         if self._autoplay_task and not self._autoplay_task.done():
@@ -145,6 +355,8 @@ class STS2AutoplayService:
             self._autoplay_task.cancel()
             try:
                 await self._autoplay_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             self._autoplay_task = None
@@ -165,12 +377,66 @@ class STS2AutoplayService:
         self._emit_status()
         return {"status": "ok", "message": f"策略已切换为 {strategy}", "strategy": strategy}
 
-    async def set_speed(self, *, post_action_delay_seconds: Optional[float] = None, poll_interval_active_seconds: Optional[float] = None) -> Dict[str, Any]:
+    async def set_speed(self, *, action_interval_seconds: Optional[float] = None, post_action_delay_seconds: Optional[float] = None, poll_interval_active_seconds: Optional[float] = None) -> Dict[str, Any]:
+        if action_interval_seconds is not None:
+            self._cfg["action_interval_seconds"] = max(0.0, float(action_interval_seconds))
         if post_action_delay_seconds is not None:
             self._cfg["post_action_delay_seconds"] = max(0.0, float(post_action_delay_seconds))
         if poll_interval_active_seconds is not None:
             self._cfg["poll_interval_active_seconds"] = max(0.1, float(poll_interval_active_seconds))
-        return {"status": "ok", "message": "速度设置已更新", "post_action_delay_seconds": self._cfg.get("post_action_delay_seconds"), "poll_interval_active_seconds": self._cfg.get("poll_interval_active_seconds")}
+        return {
+            "status": "ok",
+            "message": "速度设置已更新",
+            "action_interval_seconds": self._cfg.get("action_interval_seconds"),
+            "post_action_delay_seconds": self._cfg.get("post_action_delay_seconds"),
+            "poll_interval_active_seconds": self._cfg.get("poll_interval_active_seconds"),
+        }
+
+    async def _maybe_emit_frontend_message(self, *, event_type: str, snapshot: Optional[Dict[str, Any]] = None, action: Optional[str] = None, detail: str = "", priority: int = 5, force: bool = False) -> None:
+        notifier = self._frontend_notifier
+        if notifier is None:
+            return
+        if not bool(self._cfg.get("llm_frontend_output_enabled", False)):
+            return
+        probability = self._clamp_probability(self._cfg.get("llm_frontend_output_probability", 0.15))
+        if not force and probability <= 0.0:
+            return
+        if not force and random.random() > probability:
+            return
+        snapshot_data = snapshot if isinstance(snapshot, dict) else {}
+        screen = str(snapshot_data.get("screen") or "unknown")
+        floor = snapshot_data.get("floor") or 0
+        act = snapshot_data.get("act") or 0
+        if event_type == "action":
+            action_name = str(action or "unknown")
+            content = f"尖塔自动游玩执行了动作：{action_name}（screen={screen}, floor={floor}）"
+            description = f"尖塔动作：{action_name}"
+        elif event_type == "error":
+            content = f"尖塔自动游玩出错：{detail or self._last_error or 'unknown error'}"
+            description = "尖塔自动游玩错误"
+            action_name = str(action or "")
+        else:
+            return
+        metadata = {
+            "plugin_id": "sts2_autoplay",
+            "event_type": event_type,
+            "action": action_name,
+            "screen": screen,
+            "floor": floor,
+            "act": act,
+        }
+        try:
+            maybe_awaitable = notifier(content=content, description=description, metadata=metadata, priority=priority)
+            if isinstance(maybe_awaitable, Awaitable):
+                await maybe_awaitable
+        except Exception as exc:
+            self.logger.warning(f"frontend notification failed: {exc}")
+
+    def _clamp_probability(self, value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.0
 
     async def _poll_loop(self) -> None:
         while not self._shutdown:
@@ -199,26 +465,106 @@ class STS2AutoplayService:
         except Exception as exc:
             self._autoplay_state = "error"
             self._last_error = str(exc)
+            await self._maybe_emit_frontend_message(event_type="error", detail=str(exc), snapshot=self._snapshot, priority=7, force=True)
             self._emit_status()
 
     def _select_action(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
+        preferred_order = [
+            "confirm_modal",
+            "dismiss_modal",
+            "choose_event_option",
+            "proceed",
+            "choose_map_node",
+            "choose_treasure_relic",
+            "play_card",
+            "end_turn",
+            "use_potion",
+            "discard_potion",
+        ]
+        for action_type in preferred_order:
+            for action in actions:
+                if str(action.get("type") or "") == action_type:
+                    return action
         for action in actions:
             action_type = str(action.get("type") or "")
             if action_type and action_type not in {"wait", "noop"}:
                 return action
         return actions[0]
 
-    async def _execute_action(self, action: dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_action(self, prepared: dict[str, Any]) -> Dict[str, Any]:
         client = self._require_client()
-        raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
-        action_type = str(action.get("type") or raw.get("type") or "")
-        kwargs = {k: v for k, v in raw.items() if k != "type"}
+        action_type = str(prepared.get("action_type") or "")
+        kwargs = prepared.get("kwargs") if isinstance(prepared.get("kwargs"), dict) else {}
         result = await client.execute_action(action_type, **kwargs)
         self._last_action = action_type
         self._last_action_at = time.time()
-        self._history.appendleft({"type": "action", "time": self._last_action_at, "action": action_type, "result": result})
+        self._history.appendleft({"type": "action", "time": self._last_action_at, "action": action_type, "result": result, "kwargs": kwargs})
         self._emit_status()
         return {"status": "ok", "message": f"已执行动作: {action_type}", "action": action_type, "result": result}
+
+    def _normalize_action_kwargs(self, action_type: str, raw: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        kwargs = {
+            k: v
+            for k, v in raw.items()
+            if k not in {"type", "name", "label", "description", "requires_target", "requires_index"}
+            and not (k == "action" and isinstance(v, dict))
+        }
+        if "option_index" not in kwargs and "index" not in kwargs and "card_index" not in kwargs and bool(raw.get("requires_index")):
+            if action_type in {"choose_map_node", "choose_treasure_relic", "choose_event_option", "choose_rest_option", "select_deck_card", "buy_card", "buy_relic", "buy_potion", "discard_potion"}:
+                kwargs["option_index"] = 0 if action_type != "discard_potion" else self._find_discardable_potion_index(context)
+            elif action_type == "use_potion":
+                kwargs["option_index"] = self._find_usable_potion_index(context)
+            elif action_type == "play_card":
+                kwargs["card_index"] = self._find_playable_card_index(context)
+                target_index = self._find_card_target_index(context, kwargs["card_index"])
+                if target_index is not None:
+                    kwargs["target_index"] = target_index
+            else:
+                kwargs["index"] = 0
+        return kwargs
+
+    def _find_discardable_potion_index(self, context: dict[str, Any]) -> int:
+        for potion in self._potions(context):
+            if bool(potion.get("can_discard")):
+                return int(potion.get("index", 0))
+        raise RuntimeError("当前没有可丢弃的药水")
+
+    def _find_usable_potion_index(self, context: dict[str, Any]) -> int:
+        for potion in self._potions(context):
+            if bool(potion.get("can_use")):
+                return int(potion.get("index", 0))
+        raise RuntimeError("当前没有可使用的药水")
+
+    def _find_playable_card_index(self, context: dict[str, Any]) -> int:
+        combat = self._combat_state(context)
+        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+        for card in hand:
+            if isinstance(card, dict) and bool(card.get("playable")):
+                return int(card.get("index", 0))
+        raise RuntimeError("当前没有可打出的卡牌")
+
+    def _find_card_target_index(self, context: dict[str, Any], card_index: int) -> Optional[int]:
+        combat = self._combat_state(context)
+        hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
+        for card in hand:
+            if not isinstance(card, dict) or int(card.get("index", -1)) != card_index:
+                continue
+            valid_target_indices = card.get("valid_target_indices") if isinstance(card.get("valid_target_indices"), list) else []
+            if valid_target_indices:
+                return int(valid_target_indices[0])
+            return None
+        return None
+
+    def _combat_state(self, context: dict[str, Any]) -> dict[str, Any]:
+        raw_state = context.get("snapshot", {}).get("raw_state") if isinstance(context.get("snapshot"), dict) else {}
+        combat = raw_state.get("combat") if isinstance(raw_state, dict) and isinstance(raw_state.get("combat"), dict) else {}
+        return combat
+
+    def _potions(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        raw_state = context.get("snapshot", {}).get("raw_state") if isinstance(context.get("snapshot"), dict) else {}
+        run = raw_state.get("run") if isinstance(raw_state, dict) and isinstance(raw_state.get("run"), dict) else {}
+        potions = run.get("potions") if isinstance(run.get("potions"), list) else []
+        return [potion for potion in potions if isinstance(potion, dict)]
 
     def _require_client(self) -> STS2ApiClient:
         if self._client is None:

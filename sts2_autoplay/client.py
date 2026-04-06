@@ -32,11 +32,17 @@ class STS2ApiClient:
         return await self._request("GET", "/actions/available")
 
     async def execute_action(self, action: str, **kwargs: Any) -> Dict[str, Any]:
-        payload = {"action": {"type": action}}
+        return await self._request("POST", "/action", json=self._build_action_payload(action, **kwargs))
+
+    def _build_action_payload(self, action_name: str, **kwargs: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"action": action_name}
         for key, value in kwargs.items():
-            if value is not None:
-                payload["action"][key] = value
-        return await self._request("POST", "/action", json=payload)
+            if value is None or key == "type":
+                continue
+            if key == "action" and isinstance(value, dict):
+                continue
+            payload[key] = value
+        return payload
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"

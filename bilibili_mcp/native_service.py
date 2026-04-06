@@ -1,15 +1,546 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
 import os
+import random
+import struct
+import time
 import webbrowser
+import zlib
+from collections import deque
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
+from urllib.parse import urlencode
 
 from bilibili_api import Credential, comment, dynamic, favorite_list, hot, rank, search, session, user, video
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 from bilibili_api.utils.picture import Picture
+
+_MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
+
+WS_URL = "wss://broadcastlv.chat.bilibili.com/sub"
+HEADER_LEN = 16
+PROTOCOL_VERSION_HEARTBEAT = 1
+PROTOCOL_VERSION_ZLIB = 2
+PROTOCOL_VERSION_BROTLI = 3
+OPERATION_HEARTBEAT = 2
+OPERATION_HEARTBEAT_REPLY = 3
+OPERATION_SEND_MSG = 5
+OPERATION_AUTH = 7
+OPERATION_AUTH_REPLY = 8
+
+_module_logger: Optional[Callable[[str, str], None]] = None
+
+
+def _get_mixin_key(img_key: str, sub_key: str) -> str:
+    if not img_key or not sub_key or len(img_key) != 32 or len(sub_key) != 32:
+        return ""
+    raw = img_key + sub_key
+    return "".join(raw[i] for i in _MIXIN_KEY_ENC_TAB if i < len(raw))[:32]
+
+
+def _wbi_sign(params: dict, mixin_key: str) -> dict:
+    wts = int(time.time())
+    params = dict(params)
+    params["wts"] = wts
+    filtered = {
+        k: "".join(c for c in str(v) if c not in "!'()*")
+        for k, v in sorted(params.items())
+    }
+    query = urlencode(filtered)
+    params["w_rid"] = hashlib.md5((query + mixin_key).encode()).hexdigest()
+    return params
+
+
+def _pack(operation: int, body: bytes, proto_ver: int = PROTOCOL_VERSION_HEARTBEAT) -> bytes:
+    total = HEADER_LEN + len(body)
+    return struct.pack(">IHHII", total, HEADER_LEN, proto_ver, operation, 1) + body
+
+
+def _unpack_header(data: bytes):
+    return struct.unpack(">IHHII", data[:HEADER_LEN])
+
+
+def _decompress(data: bytes, proto_ver: int) -> bytes:
+    if proto_ver == PROTOCOL_VERSION_ZLIB:
+        return zlib.decompress(data)
+    if proto_ver == PROTOCOL_VERSION_BROTLI:
+        try:
+            import brotli
+            return brotli.decompress(data)
+        except ImportError:
+            if _module_logger:
+                _module_logger("brotli 库未安装，无法解压 brotli 数据包", "warning")
+            return b""
+    return data
+
+
+def _split_packets(data: bytes) -> List[bytes]:
+    packets: List[bytes] = []
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < HEADER_LEN:
+            break
+        total_len = struct.unpack(">I", data[offset:offset + 4])[0]
+        if total_len < HEADER_LEN or offset + total_len > len(data):
+            break
+        packets.append(data[offset:offset + total_len])
+        offset += total_len
+    return packets
+
+
+class _LiveDanmakuClient:
+    def __init__(
+        self,
+        room_id: int,
+        credential: Optional[Credential],
+        logger,
+        callbacks: Optional[Dict[str, Callable[..., None]]] = None,
+        danmaku_max_length: int = 20,
+    ) -> None:
+        self.room_id = room_id
+        self.real_room_id = room_id
+        self.credential = credential
+        self.logger = logger
+        self.callbacks = callbacks or {}
+        self.running = False
+        self._stop_event = asyncio.Event()
+        self._ws = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._buvid3_temp = ""
+        self._danmaku_max_length = max(1, min(100, int(danmaku_max_length or 20)))
+        self._wbi_mixin_key = ""
+        self._wbi_key_ts = 0.0
+        self._wbi_key_ttl = 43200.0
+
+        global _module_logger
+        if logger:
+            _module_logger = lambda msg, level="info": getattr(logger, level, logger.info)(msg)
+
+    def _log(self, msg: str, level: str = "info") -> None:
+        if self.logger:
+            getattr(self.logger, level, self.logger.info)(msg)
+
+    def _emit(self, event: str, *args, **kwargs) -> None:
+        cb = self.callbacks.get(event)
+        if not cb:
+            return
+        try:
+            cb(*args, **kwargs)
+        except Exception as exc:
+            self._log(f"回调 {event} 异常: {exc}", "warning")
+
+    async def _get_wbi_mixin_key(self, cookies: Dict[str, str]) -> str:
+        now = time.time()
+        if self._wbi_mixin_key and (now - self._wbi_key_ts) < self._wbi_key_ttl:
+            return self._wbi_mixin_key
+        try:
+            import aiohttp
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+            }
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.get(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    data = await resp.json()
+                    wbi_img = data.get("data", {}).get("wbi_img", {})
+                    img_url = wbi_img.get("img_url", "")
+                    sub_url = wbi_img.get("sub_url", "")
+                    img_key = img_url.rsplit("/", 1)[-1].split(".")[0] if img_url else ""
+                    sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0] if sub_url else ""
+                    if img_key and sub_key:
+                        mixin_key = _get_mixin_key(img_key, sub_key)
+                        if mixin_key:
+                            self._wbi_mixin_key = mixin_key
+                            self._wbi_key_ts = now
+                            return mixin_key
+        except Exception as exc:
+            self._log(f"获取 WBI key 失败: {exc}", "warning")
+        return ""
+
+    async def _get_real_room_id(self, room_id: int) -> int:
+        try:
+            import aiohttp
+            url = f"https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={room_id}"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    data = await resp.json()
+                    if data.get("code") == 0:
+                        return int(data["data"]["room_info"]["room_id"])
+        except Exception as exc:
+            self._log(f"获取真实房间号失败: {exc}", "warning")
+        return room_id
+
+    async def _fetch_buvid3(self) -> str:
+        try:
+            import aiohttp
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://www.bilibili.com/",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                    allow_redirects=True,
+                ) as resp:
+                    buvid3 = resp.cookies.get("buvid3")
+                    if buvid3:
+                        return buvid3.value if hasattr(buvid3, "value") else str(buvid3)
+                    for raw in resp.headers.getall("Set-Cookie", []):
+                        if "buvid3=" not in raw:
+                            continue
+                        for part in raw.split(";"):
+                            part = part.strip()
+                            if part.startswith("buvid3="):
+                                return part[len("buvid3="):]
+        except Exception as exc:
+            self._log(f"获取临时 buvid3 失败: {exc}", "warning")
+        return ""
+
+    async def _get_danmaku_server_info(self, real_room_id: int) -> tuple[str, str]:
+        try:
+            import aiohttp
+
+            buvid3 = ""
+            if self.credential:
+                buvid3 = getattr(self.credential, "buvid3", "") or ""
+            if not buvid3:
+                buvid3 = await self._fetch_buvid3()
+                if buvid3 and self.credential:
+                    try:
+                        self.credential.buvid3 = buvid3
+                    except Exception:
+                        pass
+                self._buvid3_temp = buvid3
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"https://live.bilibili.com/{real_room_id}",
+            }
+            cookies: Dict[str, str] = {"buvid3": buvid3} if buvid3 else {}
+            if self.credential:
+                cookies.update({
+                    "SESSDATA": getattr(self.credential, "sessdata", "") or "",
+                    "bili_jct": getattr(self.credential, "bili_jct", "") or "",
+                    "DedeUserID": getattr(self.credential, "dedeuserid", "") or "",
+                })
+                cookies = {k: v for k, v in cookies.items() if v}
+
+            params = {"id": real_room_id, "type": 0}
+            mixin_key = await self._get_wbi_mixin_key(cookies)
+            if mixin_key:
+                params = _wbi_sign(params, mixin_key)
+
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.get(
+                    "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo",
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("code") == 0:
+                        token = data["data"].get("token", "")
+                        hosts = data["data"].get("host_list", [])
+                        if hosts:
+                            host = hosts[0]
+                            return f"wss://{host['host']}:{host['wss_port']}/sub", token
+        except Exception as exc:
+            self._log(f"获取弹幕服务器信息失败: {exc}", "warning")
+        return WS_URL, ""
+
+    def _build_auth_body(self, real_room_id: int, token: str) -> bytes:
+        uid = 0
+        buvid3 = ""
+        if self.credential:
+            try:
+                uid = int(getattr(self.credential, "dedeuserid", 0) or 0)
+            except Exception:
+                uid = 0
+            buvid3 = getattr(self.credential, "buvid3", "") or ""
+        if not buvid3:
+            buvid3 = self._buvid3_temp
+        body = {
+            "uid": uid,
+            "roomid": real_room_id,
+            "protover": 2,
+            "platform": "web",
+            "type": 2,
+            "key": token,
+        }
+        if buvid3:
+            body["buvid"] = buvid3
+        return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+    async def _heartbeat_loop(self) -> None:
+        try:
+            while self.running and self._ws:
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=30)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                if self.running and self._ws:
+                    try:
+                        await self._ws.send(_pack(OPERATION_HEARTBEAT, b"[object Object]"))
+                    except Exception:
+                        break
+        except asyncio.CancelledError:
+            pass
+
+    def _dispatch_message(self, cmd: str, data: dict) -> None:
+        try:
+            if cmd == "DANMU_MSG":
+                info = data.get("info", [])
+                if not isinstance(info, list) or len(info) < 2:
+                    return
+                content = str(info[1]) if info[1] is not None else ""
+                user_info = info[2] if len(info) > 2 else []
+                if isinstance(user_info, list):
+                    user_id = user_info[0] if len(user_info) > 0 else 0
+                    user_name = str(user_info[1]) if len(user_info) > 1 else "未知"
+                else:
+                    user_id, user_name = 0, "未知"
+                user_level = 0
+                if len(info) > 4 and isinstance(info[4], list) and len(info[4]) > 0:
+                    try:
+                        user_level = int(info[4][0])
+                    except (TypeError, ValueError):
+                        user_level = 0
+                try:
+                    ts = info[0][4] / 1000 if isinstance(info[0], list) and len(info[0]) > 4 else None
+                    time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else datetime.now().strftime("%H:%M:%S")
+                except Exception:
+                    time_str = datetime.now().strftime("%H:%M:%S")
+                medal_text = ""
+                if len(info) > 3 and isinstance(info[3], list) and len(info[3]) >= 2:
+                    try:
+                        medal_level = int(info[3][0])
+                        medal_name = str(info[3][1])
+                        medal_text = f"[{medal_name}{medal_level}]"
+                    except Exception:
+                        pass
+                self._emit("on_danmaku", {
+                    "time": time_str,
+                    "content": content,
+                    "user_id": user_id,
+                    "user_name": user_name,
+                    "user_level": user_level,
+                    "medal_text": medal_text,
+                    "medal_level": 0,
+                    "medal_name": "",
+                })
+            elif cmd == "SEND_GIFT":
+                inner = data.get("data", {})
+                self._emit("on_gift", {
+                    "user_name": inner.get("uname", "未知"),
+                    "user_id": inner.get("uid", 0),
+                    "gift_name": inner.get("giftName", "未知礼物"),
+                    "num": inner.get("num", 1),
+                    "coin_type": inner.get("coin_type", "silver"),
+                    "total_coin": inner.get("total_coin", 0),
+                    "price": inner.get("price", 0),
+                })
+            elif cmd == "SUPER_CHAT_MESSAGE":
+                inner = data.get("data", {})
+                user_info = inner.get("user_info", {})
+                self._emit("on_sc", {
+                    "user_name": user_info.get("uname", "未知"),
+                    "user_id": inner.get("uid", 0),
+                    "message": inner.get("message", ""),
+                    "price": inner.get("price", 0),
+                    "start_time": inner.get("start_time", 0),
+                })
+            elif cmd == "LIVE":
+                self._emit("on_live")
+            elif cmd == "PREPARING":
+                self._emit("on_preparing")
+        except Exception as exc:
+            self._log(f"分发消息 {cmd} 异常: {exc}", "debug")
+
+    def _process_packet(self, raw: bytes) -> None:
+        if len(raw) < HEADER_LEN:
+            return
+        total_len, header_len, proto_ver, operation, _seq = _unpack_header(raw)
+        body = raw[header_len:total_len]
+        if operation == OPERATION_HEARTBEAT_REPLY:
+            return
+        if operation == OPERATION_AUTH_REPLY:
+            try:
+                result = json.loads(body.decode("utf-8"))
+                if result.get("code") != 0:
+                    self.running = False
+                    self._stop_event.set()
+                    self._log(f"认证失败: {result}", "warning")
+            except Exception as exc:
+                self._log(f"解析认证回包异常: {exc}", "debug")
+            return
+        if operation != OPERATION_SEND_MSG:
+            return
+        if proto_ver in (PROTOCOL_VERSION_ZLIB, PROTOCOL_VERSION_BROTLI):
+            try:
+                decompressed = _decompress(body, proto_ver)
+                for pkt in _split_packets(decompressed):
+                    self._process_packet(pkt)
+            except Exception as exc:
+                self._log(f"解压失败: {exc}", "warning")
+            return
+        try:
+            msg = json.loads(body.decode("utf-8"))
+            cmd = str(msg.get("cmd", "")).split(":")[0]
+            self._dispatch_message(cmd, msg)
+        except Exception as exc:
+            self._log(f"解析消息失败: {exc}", "warning")
+
+    async def _connect_once(self) -> None:
+        import inspect
+        import websockets
+
+        if self._stop_event.is_set():
+            return
+        real_room_id = await self._get_real_room_id(self.room_id)
+        if self._stop_event.is_set():
+            return
+        self.real_room_id = real_room_id
+        ws_url, token = await self._get_danmaku_server_info(real_room_id)
+        if self._stop_event.is_set():
+            return
+        auth_body = self._build_auth_body(real_room_id, token)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://live.bilibili.com",
+        }
+        sig = inspect.signature(websockets.connect)
+        ws_kwargs = {"additional_headers": headers} if "additional_headers" in sig.parameters else {"extra_headers": headers}
+        try:
+            async with websockets.connect(ws_url, ping_interval=None, **ws_kwargs) as ws:
+                self._ws = ws
+                await ws.send(_pack(OPERATION_AUTH, auth_body))
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                async for message in ws:
+                    if self._stop_event.is_set():
+                        break
+                    if isinstance(message, bytes):
+                        self._process_packet(message)
+        finally:
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+            self._ws = None
+
+    async def start(self) -> None:
+        self._stop_event.clear()
+        self.running = True
+        retry_count = 0
+        while True:
+            if self._stop_event.is_set():
+                break
+            try:
+                await self._connect_once()
+            except Exception as exc:
+                self._log(f"连接过程异常: {exc}", "error")
+                self._emit("on_error", exc)
+            if self._stop_event.is_set():
+                break
+            retry_count += 1
+            if retry_count > 10:
+                break
+            wait = min(5 * retry_count, 60)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+        self.running = False
+
+    async def send_danmaku(
+        self,
+        message: str,
+        room_id: int,
+        credential: Optional[Credential] = None,
+        danmaku_max_length: int = 20,
+    ) -> Dict[str, Any]:
+        if not credential:
+            return {"success": False, "message": "未登录，无法发送弹幕"}
+        bili_jct = getattr(credential, "bili_jct", "")
+        sessdata = getattr(credential, "sessdata", "")
+        dedeuserid = getattr(credential, "dedeuserid", "")
+        if not bili_jct:
+            return {"success": False, "message": "缺少 bili_jct，无法发送弹幕"}
+        message = str(message).strip()
+        if not message:
+            return {"success": False, "message": "弹幕内容不能为空"}
+        max_len = danmaku_max_length or self._danmaku_max_length or 20
+        if len(message) > max_len:
+            message = message[:max_len]
+        try:
+            import aiohttp
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": f"https://live.bilibili.com/{room_id}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            cookies = {
+                "SESSDATA": sessdata,
+                "bili_jct": bili_jct,
+                "DedeUserID": dedeuserid,
+            }
+            cookies = {k: v for k, v in cookies.items() if v}
+            payload = {
+                "bubble": "0",
+                "msg": message,
+                "color": "16777215",
+                "mode": "1",
+                "fontsize": "25",
+                "rnd": int(time.time() * 1000000) + random.randint(0, 999),
+                "roomid": room_id,
+                "csrf": bili_jct,
+                "csrf_token": bili_jct,
+            }
+            async with aiohttp.ClientSession(cookies=cookies) as session:
+                async with session.post(
+                    "https://api.live.bilibili.com/msg/send",
+                    data=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("code") == 0:
+                        return {"success": True, "message": f"弹幕发送成功: {message}"}
+                    msg = data.get("message", "未知错误")
+                    return {"success": False, "message": f"发送失败: {msg} (code={data.get('code', -1)})"}
+        except Exception as exc:
+            self._log(f"弹幕发送异常: {exc}", "error")
+            return {"success": False, "message": f"发送异常: {exc}"}
+
+    async def stop(self) -> None:
+        self.running = False
+        self._stop_event.set()
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        self._ws = None
+
+    def is_running(self) -> bool:
+        return self.running
 
 
 class BilibiliNativeService:
@@ -47,6 +578,16 @@ class BilibiliNativeService:
         self.credential_file = plugin_dir / "bili_credential.json"
         self.qr_file = plugin_dir / "qrcode_login.png"
         self._login_session: Optional[QrCodeLogin] = None
+        self.live_room_id: int = 0
+        self.live_danmaku_max_length: int = 20
+        self.live_listener: Optional[_LiveDanmakuClient] = None
+        self.live_listen_task = None
+        self.live_connecting = False
+        self.live_danmaku_queue: Deque[Dict[str, Any]] = deque(maxlen=200)
+        self.live_sc_queue: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self.live_gift_queue: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self.live_event_queue: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self.live_total_received = 0
 
     def load_credential(self) -> Optional[Credential]:
         if not self.credential_file.exists():
@@ -78,6 +619,167 @@ class BilibiliNativeService:
         except Exception:
             if self.logger:
                 self.logger.debug("Failed to remove QR file", exc_info=True)
+
+    def configure_live(self, *, room_id: int = 0, danmaku_max_length: int = 20) -> None:
+        self.live_room_id = max(0, int(room_id or 0))
+        self.live_danmaku_max_length = max(1, min(100, int(danmaku_max_length or 20)))
+
+    def _build_live_credential(self) -> Optional[Credential]:
+        return self.load_credential()
+
+    def _append_live_event(self, queue: Deque[Dict[str, Any]], payload: Dict[str, Any]) -> None:
+        queue.append(payload)
+        self.live_total_received += 1
+
+    def _on_live_danmaku(self, data: Dict[str, Any]) -> None:
+        self._append_live_event(self.live_danmaku_queue, data)
+
+    def _on_live_gift(self, data: Dict[str, Any]) -> None:
+        self._append_live_event(self.live_gift_queue, data)
+
+    def _on_live_sc(self, data: Dict[str, Any]) -> None:
+        self._append_live_event(self.live_sc_queue, data)
+
+    def _on_live_status(self, event_type: str, message: str) -> None:
+        self.live_event_queue.append({"type": event_type, "message": message})
+
+    def _on_live_error(self, error: Exception) -> None:
+        self.live_event_queue.append({"type": "error", "message": str(error)})
+
+    async def _run_live_listener(self, listener: _LiveDanmakuClient) -> None:
+        try:
+            await listener.start()
+        finally:
+            if self.live_listener is listener:
+                self.live_connecting = False
+
+    async def set_live_room_id(self, room_id: int) -> Dict[str, Any]:
+        if room_id <= 0:
+            raise RuntimeError("room_id 必须是正整数")
+        old_room_id = self.live_room_id
+        self.live_room_id = int(room_id)
+        if self.live_listener and (self.live_listener.is_running() or self.live_connecting):
+            await self.start_live_listener(room_id=self.live_room_id, restart=True)
+        return {
+            "room_id": self.live_room_id,
+            "old_room_id": old_room_id,
+            "restarting": bool(old_room_id and old_room_id != self.live_room_id),
+        }
+
+    async def start_live_listener(self, room_id: int = 0, restart: bool = False) -> Dict[str, Any]:
+        if room_id > 0:
+            self.live_room_id = int(room_id)
+        if self.live_room_id <= 0:
+            raise RuntimeError("未设置直播间ID")
+        if restart:
+            await self.stop_live_listener()
+        elif self.live_listener and (self.live_listener.is_running() or self.live_connecting):
+            return {
+                "room_id": self.live_room_id,
+                "connecting": self.live_connecting,
+                "listening": self.live_listener.is_running(),
+                "message": f"已在监听直播间 {self.live_room_id}",
+            }
+
+        credential = self._build_live_credential()
+        listener = _LiveDanmakuClient(
+            room_id=self.live_room_id,
+            credential=credential,
+            logger=self.logger,
+            callbacks={
+                "on_danmaku": self._on_live_danmaku,
+                "on_gift": self._on_live_gift,
+                "on_sc": self._on_live_sc,
+                "on_live": lambda: self._on_live_status("live", f"直播间 {self.live_room_id} 开播了"),
+                "on_preparing": lambda: self._on_live_status("preparing", f"直播间 {self.live_room_id} 已下播"),
+                "on_error": self._on_live_error,
+            },
+            danmaku_max_length=self.live_danmaku_max_length,
+        )
+        self.live_listener = listener
+        self.live_connecting = True
+        self.live_listen_task = __import__("asyncio").create_task(self._run_live_listener(listener))
+        return {
+            "room_id": self.live_room_id,
+            "connecting": True,
+            "listening": False,
+            "message": f"正在连接直播间 {self.live_room_id}",
+        }
+
+    async def stop_live_listener(self) -> Dict[str, Any]:
+        listener = self.live_listener
+        task = self.live_listen_task
+        self.live_listener = None
+        self.live_listen_task = None
+        self.live_connecting = False
+        if listener is not None:
+            await listener.stop()
+        if task is not None:
+            try:
+                await task
+            except Exception:
+                pass
+        return {"room_id": self.live_room_id, "stopped": True}
+
+    async def get_live_status(self) -> Dict[str, Any]:
+        listener = self.live_listener
+        listening = bool(listener and listener.is_running())
+        real_room_id = getattr(listener, "real_room_id", self.live_room_id) if listener else self.live_room_id
+        return {
+            "room_id": self.live_room_id,
+            "real_room_id": real_room_id,
+            "connecting": self.live_connecting,
+            "listening": listening,
+            "logged_in": self.load_credential() is not None,
+            "danmaku_max_length": self.live_danmaku_max_length,
+            "queue_size": len(self.live_danmaku_queue),
+            "sc_queue_size": len(self.live_sc_queue),
+            "gift_queue_size": len(self.live_gift_queue),
+            "received": self.live_total_received,
+        }
+
+    async def drain_live_events(self, max_count: int = 10, include_gifts: bool = True) -> Dict[str, Any]:
+        max_count = max(1, min(30, int(max_count or 10)))
+        danmaku = []
+        while self.live_danmaku_queue and len(danmaku) < max_count:
+            danmaku.append(self.live_danmaku_queue.popleft())
+        superchat = []
+        while self.live_sc_queue:
+            superchat.append(self.live_sc_queue.popleft())
+        gifts = []
+        if include_gifts:
+            while self.live_gift_queue and len(gifts) < 5:
+                gifts.append(self.live_gift_queue.popleft())
+        events = []
+        while self.live_event_queue:
+            events.append(self.live_event_queue.popleft())
+        status = await self.get_live_status()
+        status.update({
+            "danmaku": danmaku,
+            "superchat": superchat,
+            "gifts": gifts,
+            "events": events,
+            "danmaku_count": len(danmaku),
+            "sc_count": len(superchat),
+            "gift_count": len(gifts),
+            "event_count": len(events),
+        })
+        return status
+
+    async def send_live_danmaku(self, message: str) -> Dict[str, Any]:
+        listener = self.live_listener
+        if not listener:
+            raise RuntimeError("当前未连接直播间")
+        credential = self._build_live_credential()
+        if credential is None:
+            raise RuntimeError("未登录B站！请先调用 bili_login 获取登录二维码。")
+        room_id = getattr(listener, "real_room_id", 0) or self.live_room_id
+        return await listener.send_danmaku(
+            message=message,
+            room_id=room_id,
+            credential=credential,
+            danmaku_max_length=self.live_danmaku_max_length,
+        )
 
     def open_qr_in_browser(self) -> None:
         if not self.qr_file.exists():

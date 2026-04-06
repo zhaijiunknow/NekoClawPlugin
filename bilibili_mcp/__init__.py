@@ -29,14 +29,20 @@ class BilibiliMCPPlugin(NekoPluginBase):
         credential_file = self._cfg.get("credential_file")
         if isinstance(credential_file, str) and credential_file.strip():
             self._service.credential_file = Path(credential_file.strip()).expanduser()
+        self._service.configure_live(
+            room_id=int(self._cfg.get("live_room_id", 0) or 0),
+            danmaku_max_length=int(self._cfg.get("live_danmaku_max_length", 20) or 20),
+        )
         return Ok({
             "status": "ready",
             "credential_file": str(self._service.credential_file),
             "logged_in": self._service.load_credential() is not None,
+            "live_room_id": self._service.live_room_id,
         })
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_):
+        await self._service.stop_live_listener()
         self._service.clear_qr_artifacts()
         return Ok({"status": "shutdown"})
 
@@ -557,6 +563,122 @@ class BilibiliMCPPlugin(NekoPluginBase):
             return self._err(e)
 
     @plugin_entry(
+        id="bili_live_set_room",
+        name="设置直播间",
+        description="设置要监听的 B 站直播间房间号。",
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "room_id": {"type": "integer"}
+            },
+            "required": ["room_id"],
+        },
+    )
+    async def bili_live_set_room(self, room_id: int, **_):
+        try:
+            payload = await self._service.set_live_room_id(room_id)
+            payload["message"] = f"已设置直播间 {payload['room_id']}"
+            return self._ok(payload)
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
+        id="bili_live_connect",
+        name="连接直播弹幕",
+        description="连接 B 站直播间实时弹幕。",
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "room_id": {"type": "integer"}
+            },
+        },
+    )
+    async def bili_live_connect(self, room_id: int = 0, **_):
+        try:
+            return self._ok(await self._service.start_live_listener(room_id=room_id))
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
+        id="bili_live_status",
+        name="直播弹幕状态",
+        description="获取当前直播弹幕监听状态。",
+        llm_result_fields=["summary"],
+        input_schema={"type": "object", "properties": {}},
+    )
+    async def bili_live_status(self, **_):
+        try:
+            payload = await self._service.get_live_status()
+            payload["message"] = (
+                f"直播间 {payload['room_id']} | "
+                f"{'监听中' if payload['listening'] else ('连接中' if payload['connecting'] else '未连接')} | "
+                f"弹幕缓冲 {payload['queue_size']}"
+            )
+            return self._ok(payload)
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
+        id="bili_live_fetch",
+        name="获取直播弹幕",
+        description="获取当前直播间缓冲的实时弹幕、礼物和 SC。",
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "max_count": {"type": "integer", "default": 10},
+                "include_gifts": {"type": "boolean", "default": True},
+            },
+        },
+    )
+    async def bili_live_fetch(self, max_count: int = 10, include_gifts: bool = True, **_):
+        try:
+            payload = await self._service.drain_live_events(max_count=max_count, include_gifts=include_gifts)
+            payload["message"] = (
+                f"直播间 {payload['room_id']}：弹幕 {payload['danmaku_count']} 条，"
+                f"SC {payload['sc_count']} 条，礼物 {payload['gift_count']} 条，事件 {payload['event_count']} 条"
+            )
+            return self._ok(payload)
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
+        id="bili_live_disconnect",
+        name="断开直播弹幕",
+        description="停止当前直播弹幕监听。",
+        llm_result_fields=["summary"],
+        input_schema={"type": "object", "properties": {}},
+    )
+    async def bili_live_disconnect(self, **_):
+        try:
+            payload = await self._service.stop_live_listener()
+            payload["message"] = f"已停止监听直播间 {payload['room_id']}"
+            return self._ok(payload)
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
+        id="bili_live_send_danmaku",
+        name="发送直播弹幕",
+        description="向当前已连接的 B 站直播间发送弹幕。",
+        llm_result_fields=["summary"],
+        input_schema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"}
+            },
+            "required": ["message"],
+        },
+    )
+    async def bili_live_send_danmaku(self, message: str, **_):
+        try:
+            return self._ok(await self._service.send_live_danmaku(message))
+        except Exception as e:
+            return self._err(e)
+
+    @plugin_entry(
         id="bili_list_mcp_tools",
         name="列出 Bilibili 能力",
         description="列出当前原生 bilibili 插件暴露的能力。",
@@ -589,5 +711,11 @@ class BilibiliMCPPlugin(NekoPluginBase):
             "bili_crawl",
             "bili_send_dynamic",
             "bili_send_message",
+            "bili_live_set_room",
+            "bili_live_connect",
+            "bili_live_status",
+            "bili_live_fetch",
+            "bili_live_disconnect",
+            "bili_live_send_danmaku",
         ]
         return Ok({"total": len(tools), "tools": tools, "native": True})

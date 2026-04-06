@@ -19,5 +19,9 @@ auto_start = true
 [plugin.store]
 enabled = false
 
+[bilibili_mcp]
+live_room_id = 0
+live_danmaku_max_length = 20
+
 [bilibili_mcp.env]
 PYTHONIOENCODING = "utf-8"
