@@ -1104,7 +1104,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="start_qq_server",
         name="开启QQ服务器",
-        description="开启 QQ 服务器（NapCat.Shell / OneBot）。",
+        description="开启 QQ 服务器。",
         input_schema={
             "type": "object",
             "properties": {
