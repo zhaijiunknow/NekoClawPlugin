@@ -12,7 +12,6 @@ import asyncio
 import json
 import os
 import random
-import socket
 import subprocess
 import time
 from pathlib import Path
@@ -143,7 +142,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="start_auto_reply",
         name="启动自动回复",
-        description="启动 QQ 自动回复监听。",
+        description="开始监听 QQ 消息并自动回复。",
         input_schema={
             "type": "object",
             "properties": {},
@@ -174,7 +173,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="stop_auto_reply",
         name="停止自动回复",
-        description="停止 QQ 自动回复监听。",
+        description="停止监听 QQ 消息。",
         input_schema={
             "type": "object",
             "properties": {},
@@ -812,10 +811,17 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return False
 
 
+    async def _invalidate_private_session(self, qq_number: str) -> None:
+        session_key = self._build_session_key(sender_id=qq_number, is_group=False)
+        user_data = self._user_sessions.pop(session_key, None)
+        session = user_data.get("session") if user_data else None
+        if session:
+            await session.close()
+
     @plugin_entry(
         id="add_trusted_user",
         name="添加信任用户",
-        description="添加信任用户到白名单。",
+        description="添加一个信任的 QQ 号到白名单。",
         input_schema={
             "type": "object",
             "properties": {
@@ -837,13 +843,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
             "required": ["qq_number"],
         },
     )
-    async def _invalidate_private_session(self, qq_number: str) -> None:
-        session_key = self._build_session_key(sender_id=qq_number, is_group=False)
-        user_data = self._user_sessions.pop(session_key, None)
-        session = user_data.get("session") if user_data else None
-        if session:
-            await session.close()
-
     async def add_trusted_user(self, qq_number: str, level: str = "trusted", nickname: str = "", **_):
         """添加信任用户并持久化到 store"""
         if not self.permission_mgr:
@@ -874,7 +873,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="remove_trusted_user",
         name="移除信任用户",
-        description="从白名单移除信任用户。",
+        description="从白名单中移除一个 QQ 号。",
         input_schema={
             "type": "object",
             "properties": {
@@ -905,7 +904,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="set_user_nickname",
         name="设置用户昵称",
-        description="设置信任用户昵称。",
+        description="为信任用户设置专属称呼。",
         input_schema={
             "type": "object",
             "properties": {
@@ -953,7 +952,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="add_trusted_group",
         name="添加信任群聊",
-        description="添加信任群聊到白名单。",
+        description="添加一个信任的 QQ 群到白名单。",
         input_schema={
             "type": "object",
             "properties": {
@@ -987,7 +986,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="remove_trusted_group",
         name="移除信任群聊",
-        description="从白名单移除信任群聊。",
+        description="从白名单中移除一个 QQ 群。",
         input_schema={
             "type": "object",
             "properties": {
@@ -1076,10 +1075,14 @@ class QQAutoReplyPlugin(NekoPluginBase):
         last_error: Optional[Exception] = None
         while time.monotonic() < deadline:
             try:
-                with socket.create_connection((host, port), timeout=1.0):
-                    self.logger.info(f"OneBot endpoint is ready: {host}:{port}")
-                    return
-            except OSError as e:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=1.0
+                )
+                writer.close()
+                await writer.wait_closed()
+                self.logger.info(f"OneBot endpoint is ready: {host}:{port}")
+                return
+            except (OSError, asyncio.TimeoutError) as e:
                 last_error = e
                 await asyncio.sleep(1)
         raise RuntimeError(f"OneBot endpoint not ready at {host}:{port}: {last_error}")
@@ -1101,7 +1104,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="start_qq_server",
         name="开启QQ服务器",
-        description="启动 QQ 服务器。",
+        description="开启 QQ 服务器（NapCat.Shell / OneBot）。",
         input_schema={
             "type": "object",
             "properties": {
@@ -1123,7 +1126,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
     @plugin_entry(
         id="stop_qq_server",
         name="关闭QQ服务器",
-        description="关闭 QQ 服务器。",
+        description="关闭 QQ 服务器并断开连接。",
         input_schema={
             "type": "object",
         },
