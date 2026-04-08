@@ -101,10 +101,10 @@ normal_relay_probability = 0.1
 
 启动顺序如下：
 
-1. 在插件管理面板手动启动 `qq_auto_reply`
-2. 插件初始化权限管理器和 QQ 客户端
-3. 插件自动在前台启动 NapCat
-4. 在NapCat的网络配置处设置`WS服务器`并把数据写入`plugin.toml`
+1. 下载并启动 NapCat
+2. 在NapCat的网络配置处设置`WS服务器`并把数据写入`plugin.toml`
+3. 在插件管理面板手动启动 `qq_auto_reply`
+4. 插件初始化权限管理器和 QQ 客户端
 5. 调用“启动自动回复”开始监听 QQ 消息
 
 **注意事项：**
@@ -177,10 +177,10 @@ await plugin.stop_auto_reply()
 ## 日志位置
 
 ```
-...\N.E.K.O\log\plugins\qq_auto_reply
+...\文档\N.E.K.O\log\
 ```
 
-日志文件命名格式：`qq_auto_reply_YYYYMMDD_HHMMSS.log`
+日志文件命名格式：`N.E.K.O_Main_xxxxxxxx.log`
 
 看到以下日志说明插件已正常启动并开始监听：
 
