@@ -371,7 +371,7 @@ class STS2AutoplayService:
 
     async def set_strategy(self, strategy: str) -> Dict[str, Any]:
         strategy = (strategy or "heuristic").strip().lower()
-        if strategy not in {"heuristic"}:
+        if strategy not in {"heuristic", "defect"}:
             raise RuntimeError(f"暂不支持策略: {strategy}")
         self._cfg["strategy"] = strategy
         self._emit_status()
@@ -510,8 +510,13 @@ class STS2AutoplayService:
             and not (k == "action" and isinstance(v, dict))
         }
         if "option_index" not in kwargs and "index" not in kwargs and "card_index" not in kwargs and bool(raw.get("requires_index")):
-            if action_type in {"choose_map_node", "choose_treasure_relic", "choose_event_option", "choose_rest_option", "select_deck_card", "buy_card", "buy_relic", "buy_potion", "discard_potion"}:
-                kwargs["option_index"] = 0 if action_type != "discard_potion" else self._find_discardable_potion_index(context)
+            if action_type == "discard_potion":
+                kwargs["option_index"] = self._find_discardable_potion_index(context)
+            elif action_type in {"choose_map_node", "choose_treasure_relic", "choose_event_option", "choose_rest_option", "select_deck_card", "buy_card", "buy_relic", "buy_potion"}:
+                preferred_option_index = self._find_preferred_card_option_index(raw, context)
+                if preferred_option_index is None:
+                    preferred_option_index = self._find_preferred_character_option_index(raw, context)
+                kwargs["option_index"] = preferred_option_index if preferred_option_index is not None else 0
             elif action_type == "use_potion":
                 kwargs["option_index"] = self._find_usable_potion_index(context)
             elif action_type == "play_card":
@@ -522,6 +527,259 @@ class STS2AutoplayService:
             else:
                 kwargs["index"] = 0
         return kwargs
+
+    def _find_preferred_card_option_index(self, raw: dict[str, Any], context: dict[str, Any]) -> Optional[int]:
+        if str(self._cfg.get("strategy") or "heuristic").strip().lower() != "defect":
+            return None
+        if not self._is_card_reward_context(raw, context):
+            return None
+        options = self._card_reward_options(raw, context)
+        if not options:
+            return None
+        best_option: Optional[dict[str, Any]] = None
+        best_score: Optional[int] = None
+        for option in options:
+            score = self._score_defect_card_option(option, context)
+            if best_score is None or score > best_score:
+                best_option = option
+                best_score = score
+        if best_option is None or best_score is None or best_score <= 0:
+            return None
+        return best_option["index"]
+
+    def _is_card_reward_context(self, raw: dict[str, Any], context: dict[str, Any]) -> bool:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        screen_candidates = {
+            self._normalized_screen_name(snapshot),
+            str(raw_state.get("screen") or "").strip().lower(),
+            str(raw_state.get("screen_type") or "").strip().lower(),
+        }
+        if any(keyword in candidate for candidate in screen_candidates for keyword in {"reward", "card reward", "card", "combat reward"} if candidate):
+            return True
+        return bool(self._card_reward_options(raw, context))
+
+    def _card_reward_options(self, raw: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+        for candidate in self._iter_option_candidates(raw):
+            options = self._extract_card_reward_options(candidate)
+            if options:
+                return options
+        for action in context.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            raw_action = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+            for candidate in self._iter_option_candidates(raw_action):
+                options = self._extract_card_reward_options(candidate)
+                if options:
+                    return options
+        return []
+
+    def _iter_option_candidates(self, raw: dict[str, Any]) -> list[Any]:
+        return [
+            raw,
+            raw.get("action") if isinstance(raw.get("action"), dict) else None,
+            raw.get("options"),
+            raw.get("choices"),
+            raw.get("cards"),
+            raw.get("items"),
+            raw.get("rewards"),
+        ]
+
+    def _extract_card_reward_options(self, candidate: Any) -> list[dict[str, Any]]:
+        if isinstance(candidate, list):
+            options: list[dict[str, Any]] = []
+            for idx, item in enumerate(candidate):
+                if not isinstance(item, dict):
+                    continue
+                texts = self._card_option_texts(item)
+                if not texts:
+                    continue
+                option_index = item.get("option_index")
+                if option_index is None:
+                    option_index = item.get("index", idx)
+                option = {
+                    "index": int(option_index),
+                    "texts": texts,
+                    "raw": item,
+                }
+                options.append(option)
+            return options
+        if isinstance(candidate, dict):
+            for key in ("options", "choices", "cards", "items", "rewards"):
+                nested = candidate.get(key)
+                if isinstance(nested, list):
+                    return self._extract_card_reward_options(nested)
+        return []
+
+    def _card_option_texts(self, item: dict[str, Any]) -> set[str]:
+        texts: set[str] = set()
+        for key in ("label", "description", "name", "id", "card_id", "card_name", "title"):
+            value = item.get(key)
+            if value is not None:
+                normalized = str(value).strip().lower()
+                if normalized:
+                    texts.add(normalized)
+        card = item.get("card") if isinstance(item.get("card"), dict) else None
+        if card is not None:
+            texts.update(self._card_option_texts(card))
+        return texts
+
+    def _score_defect_card_option(self, option: dict[str, Any], context: dict[str, Any]) -> int:
+        texts = option.get("texts") if isinstance(option.get("texts"), set) else set()
+        score = 0
+        high_priority = {
+            "冷头": 100,
+            "快速检索": 95,
+            "全息影像": 95,
+            "暴风雨": 92,
+            "冰川": 90,
+            "充电": 82,
+            "高速脱离": 80,
+            "白噪声": 72,
+            "引雷针": 94,
+            "电流相生": 92,
+            "子程序": 96,
+            "雷暴": 94,
+            "创造性ai": 88,
+            "创造性 ai": 88,
+            "超临界态": 86,
+            "双倍": 84,
+            "内核加速": 82,
+            "火箭拳": 90,
+            "污秽攻击": 74,
+            "压缩": 88,
+            "羽化": 90,
+            "万众一心": 84,
+        }
+        low_priority = {
+            "打击": -25,
+            "防御": -10,
+            "硬撑": -35,
+            "超频": -30,
+        }
+        for name, value in high_priority.items():
+            if any(name in text for text in texts):
+                score += value
+        for name, value in low_priority.items():
+            if any(name in text for text in texts):
+                score += value
+        if any("状态" in text for text in texts) and not self._defect_has_card(context, {"压缩"}):
+            score -= 18
+        if any(keyword in text for text in texts for keyword in {"能力", "power"}):
+            score += 8
+        if any(keyword in text for text in texts for keyword in {"球", "闪电球", "冰球", "充能球", "orb"}):
+            score += 10
+        return score
+
+    def _defect_has_card(self, context: dict[str, Any], names: set[str]) -> bool:
+        raw_state = context.get("snapshot", {}).get("raw_state") if isinstance(context.get("snapshot"), dict) else {}
+        for container_key in ("deck", "master_deck", "cards"):
+            cards = raw_state.get(container_key)
+            if not isinstance(cards, list):
+                continue
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                card_texts = self._card_option_texts(card)
+                if any(any(name in text for text in card_texts) for name in names):
+                    return True
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        deck = run.get("deck") if isinstance(run.get("deck"), list) else []
+        for card in deck:
+            if not isinstance(card, dict):
+                continue
+            card_texts = self._card_option_texts(card)
+            if any(any(name in text for text in card_texts) for name in names):
+                return True
+        return False
+
+    def _find_preferred_character_option_index(self, raw: dict[str, Any], context: dict[str, Any]) -> Optional[int]:
+        if not self._is_character_select_context(context):
+            return None
+        preferred_aliases = [
+            {"故障机器人", "defect"},
+            {"铁血战士", "ironclad"},
+        ]
+        options = self._character_selection_options(raw, context)
+        if not options:
+            return None
+        for aliases in preferred_aliases:
+            for option in options:
+                if self._character_option_matches(option, aliases):
+                    return option["index"]
+        return None
+
+    def _is_character_select_context(self, context: dict[str, Any]) -> bool:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        screen = self._normalized_screen_name(snapshot)
+        text_candidates = {
+            screen,
+            str(raw_state.get("screen") or "").strip().lower(),
+            str(raw_state.get("screen_type") or "").strip().lower(),
+        }
+        if any(keyword in candidate for candidate in text_candidates for keyword in {"char", "character", "player select", "select"} if candidate):
+            return True
+        for action in context.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            raw_action = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+            if self._character_selection_options(raw_action, context):
+                return True
+        return False
+
+    def _character_selection_options(self, raw: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
+        for candidate in self._iter_option_candidates(raw):
+            options = self._extract_character_options(candidate)
+            if options:
+                return options
+        for action in context.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            raw_action = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+            for candidate in self._iter_option_candidates(raw_action):
+                options = self._extract_character_options(candidate)
+                if options:
+                    return options
+        return []
+
+    def _extract_character_options(self, candidate: Any) -> list[dict[str, Any]]:
+        if isinstance(candidate, list):
+            options: list[dict[str, Any]] = []
+            for idx, item in enumerate(candidate):
+                if not isinstance(item, dict):
+                    continue
+                option_index = item.get("option_index")
+                if option_index is None:
+                    option_index = item.get("index", idx)
+                option = {
+                    "index": int(option_index),
+                    "texts": self._character_option_texts(item),
+                }
+                if option["texts"]:
+                    options.append(option)
+            return options
+        if isinstance(candidate, dict):
+            nested_keys = ("options", "choices", "characters", "items")
+            for key in nested_keys:
+                nested = candidate.get(key)
+                if isinstance(nested, list):
+                    return self._extract_character_options(nested)
+        return []
+
+    def _character_option_texts(self, item: dict[str, Any]) -> set[str]:
+        texts: set[str] = set()
+        for key in ("label", "description", "name", "id", "character", "character_id", "class", "player_class"):
+            value = item.get(key)
+            if value is not None:
+                normalized = str(value).strip().lower()
+                if normalized:
+                    texts.add(normalized)
+        return texts
+
+    def _character_option_matches(self, option: dict[str, Any], aliases: set[str]) -> bool:
+        texts = option.get("texts") if isinstance(option.get("texts"), set) else set()
+        return any(alias in texts for alias in aliases)
 
     def _find_discardable_potion_index(self, context: dict[str, Any]) -> int:
         for potion in self._potions(context):

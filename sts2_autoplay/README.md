@@ -16,10 +16,12 @@
 
 ## 如何使用 STS2 AI Agent
 
-下面内容已直接整合自原 `README.zh-CN.md`，后续即使不保留该文件，这份 `README.md` 也能单独使用。
-
 ### STS2 AI Agent 是什么
+``` 访问/下载/更新链接
 
+git clone https://gitclone.com/github.com/CharTyr/STS2-Agent.git
+
+```
 `STS2 AI Agent` 是一个给《Slay the Spire 2》使用的游戏 Mod + MCP Server 组合：
 
 - `STS2AIAgent`：把游戏状态和操作暴露为本地 HTTP API
@@ -171,7 +173,7 @@ http://127.0.0.1:8765/mcp
 - `action_interval_seconds`：每个动作之间的额外间隔
 - `post_action_delay_seconds`：动作执行后等待局面稳定的间隔
 - `autoplay_on_start`：插件启动后是否自动开始游玩
-- `strategy`：当前策略，现阶段主要是 `heuristic`
+- `strategy`：当前策略，支持 `heuristic` 与 `defect`，其中 `defect` 会启用故障机器人（鸡煲）专用选牌逻辑
 - `max_consecutive_errors`：最大连续错误次数
 - `push_notifications`：历史保留字段
 - `event_stream_enabled`：预留字段，目前未实际启用
@@ -221,7 +223,7 @@ http://127.0.0.1:8765/mcp
 
 参数：
 
-- `strategy`：当前主要使用 `heuristic`
+- `strategy`：支持 `heuristic` 与 `defect`；`defect` 使用故障机器人（鸡煲）策略文档 `strategies/defect.md`，并会根据卡牌候选项动态调整选牌
 
 ### 12. `sts2_set_speed`
 设置速度参数，并写回本地 `plugin.toml`。
