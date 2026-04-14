@@ -41,7 +41,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self._running = False
         self._message_task: Optional[asyncio.Task] = None
         self._session_housekeeping_task: Optional[asyncio.Task] = None
+        self._proactive_task: Optional[asyncio.Task] = None
         self._user_sessions: dict[str, dict[str, Any]] = {}
+        self._last_proactive_enabled = False
+        self._last_proactive_send_at = 0.0
+        self._last_proactive_greeting_at = 0.0
 
         # Normal 权限转述功能
         self._admin_qq: Optional[str] = None
@@ -51,6 +55,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self._napcat_process: Optional[asyncio.subprocess.Process] = None
         self._napcat_show_window = False
         self._napcat_log_task: Optional[asyncio.Task] = None
+        self._manages_napcat_process = False
 
     def _refresh_admin_qq(self) -> None:
         self._admin_qq = None
@@ -116,7 +121,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.qq_client = QQClient(onebot_url=onebot_url, token=token, logger=self.logger)
         self.logger.info(f"QQ 客户端已初始化: {onebot_url}")
 
-        await self._start_napcat(show_window=True)
+        if not await self._start_napcat(show_window=True):
+            self.logger.info(f"未找到内置 NapCat，使用外部 OneBot/NapCat 模式: {onebot_url}")
 
         if self._session_housekeeping_task is None or self._session_housekeeping_task.done():
             self._session_housekeeping_task = asyncio.create_task(self._session_housekeeping_loop())
@@ -158,17 +164,27 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         try:
             # 连接到 NapCat 服务
+            if self._manages_napcat_process:
+                self.logger.info("使用内置 NapCat 模式连接 OneBot 服务")
+            else:
+                self.logger.info(f"使用外部 OneBot/NapCat 模式连接: {self.qq_client.onebot_url}")
             await self.qq_client.connect()
 
             # 启动消息处理任务
             self._running = True
             self._message_task = asyncio.create_task(self._process_messages())
+            if self._proactive_task is None or self._proactive_task.done():
+                self._proactive_task = asyncio.create_task(self._proactive_chat_loop())
 
             self.logger.info("Auto reply started")
             return Ok({"status": "started"})
         except Exception as e:
             self.logger.exception("Failed to start auto reply")
-            return Err(SdkError(f"START_ERROR: 启动失败: {e}"))
+            if self._manages_napcat_process:
+                return Err(SdkError(f"START_ERROR: 启动失败: {e}"))
+            return Err(SdkError(
+                f"START_ERROR: 无法连接到 OneBot 服务 {self.qq_client.onebot_url}，请先启动外部 NapCat/OneBot: {e}"
+            ))
 
     @plugin_entry(
         id="stop_auto_reply",
@@ -197,6 +213,14 @@ class QQAutoReplyPlugin(NekoPluginBase):
             except asyncio.CancelledError:
                 pass
             self._message_task = None
+
+        if self._proactive_task:
+            self._proactive_task.cancel()
+            try:
+                await self._proactive_task
+            except asyncio.CancelledError:
+                pass
+            self._proactive_task = None
 
         if self.qq_client:
             await self.qq_client.disconnect()
@@ -335,23 +359,340 @@ class QQAutoReplyPlugin(NekoPluginBase):
         except asyncio.CancelledError:
             raise
 
+    def _load_proactive_settings(self) -> tuple[bool, float]:
+        try:
+            from utils.preferences import load_global_conversation_settings
+            settings = load_global_conversation_settings() or {}
+        except Exception as e:
+            self.logger.warning(f"读取全局主动对话设置失败: {e}")
+            settings = {}
+
+        enabled = bool(settings.get('proactiveChatEnabled', False))
+        raw_interval = settings.get('proactiveChatInterval', 30)
+        try:
+            interval_minutes = float(raw_interval)
+        except (TypeError, ValueError):
+            interval_minutes = 30.0
+        interval_seconds = max(60.0, interval_minutes * 60.0)
+        return enabled, interval_seconds
+
+    async def _proactive_chat_loop(self):
+        try:
+            while True:
+                enabled, interval_seconds = self._load_proactive_settings()
+                if enabled:
+                    await self._run_proactive_cycle(interval_seconds)
+                else:
+                    self._last_proactive_enabled = False
+                await asyncio.sleep(min(interval_seconds, 30.0) if enabled else 30.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.error(f"主动对话循环异常: {e}")
+
+    async def _run_proactive_cycle(self, interval_seconds: float):
+        target = self._select_proactive_target()
+        if not target:
+            self._last_proactive_enabled = True
+            return
+
+        now = time.time()
+        if not self._last_proactive_enabled:
+            sent = await self._send_proactive_greeting(target)
+            self._last_proactive_enabled = True
+            if sent:
+                self._last_proactive_greeting_at = now
+                self._last_proactive_send_at = now
+            return
+
+        if now - self._last_proactive_send_at < interval_seconds:
+            return
+
+        sent = await self._send_proactive_turn(target)
+        if sent:
+            self._last_proactive_send_at = now
+
+    def _select_proactive_target(self) -> Optional[dict[str, Any]]:
+        admin_qq = str(self._admin_qq or '').strip()
+        if not admin_qq:
+            return None
+
+        session_key = self._build_session_key(sender_id=admin_qq, is_group=False)
+        user_data = self._user_sessions.get(session_key)
+        if user_data:
+            return user_data
+
+        nickname = None
+        if self.permission_mgr:
+            nickname = self.permission_mgr.get_nickname(admin_qq)
+
+        return {
+            'session_key': session_key,
+            'sender_id': admin_qq,
+            'permission_level': 'admin',
+            'is_group': False,
+            'group_id': None,
+            'user_title': '主人',
+            'user_nickname': nickname,
+            'memory_enabled': True,
+        }
+
+    def _build_proactive_context_summary(self, user_data: dict[str, Any]) -> str:
+        sender_id = user_data.get('sender_id') or ''
+        user_title = user_data.get('user_title') or f'QQ用户{sender_id}'
+        session = user_data.get('session')
+        history = getattr(session, '_conversation_history', []) if session else []
+        recent_messages = self._conversation_slice_to_memory_messages(history, max(0, len(history) - 6))
+        lines = [
+            '当前是 QQ 私聊主动对话场景。',
+            f'目标用户 QQ: {sender_id}',
+            f'目标称呼: {user_title}',
+        ]
+        if recent_messages:
+            lines.append('最近对话摘录：')
+            for item in recent_messages[-6:]:
+                role = '对方' if item.get('role') == 'user' else '你'
+                text_parts = item.get('content') or []
+                text = ''.join(part.get('text', '') for part in text_parts if isinstance(part, dict)).strip()
+                if text:
+                    lines.append(f'- {role}: {text[:120]}')
+        else:
+            lines.append('最近没有新的QQ对话摘录，可自然开启话题。')
+        return '\n'.join(lines)
+
+    async def _fetch_memory_context(self, her_name: str) -> str:
+        try:
+            import httpx
+            from config import MEMORY_SERVER_PORT
+
+            async with httpx.AsyncClient(timeout=5.0, proxy=None, trust_env=False) as client:
+                response = await client.get(f"http://127.0.0.1:{MEMORY_SERVER_PORT}/new_dialog/{her_name}")
+                if response.is_success:
+                    return response.text.strip()
+                self.logger.warning(f"主动对话读取 Memory Server 上下文失败: {response.status_code}")
+        except Exception as e:
+            self.logger.warning(f"主动对话读取 Memory Server 上下文失败: {e}")
+        return ''
+
+    async def _fetch_last_conversation_gap(self, her_name: str) -> Optional[float]:
+        try:
+            import httpx
+            from config import MEMORY_SERVER_PORT
+
+            async with httpx.AsyncClient(timeout=3.0, proxy=None, trust_env=False) as client:
+                response = await client.get(f"http://127.0.0.1:{MEMORY_SERVER_PORT}/last_conversation_gap/{her_name}")
+                response.raise_for_status()
+                data = response.json()
+            gap = data.get('gap_seconds')
+            return float(gap) if gap is not None else None
+        except Exception as e:
+            self.logger.warning(f"读取上次对话间隔失败: {e}")
+            return None
+
+    def _format_elapsed_gap(self, gap_seconds: float) -> str:
+        if gap_seconds < 3600:
+            minutes = max(1, int(gap_seconds // 60))
+            return f"{minutes}分钟"
+        if gap_seconds < 86400:
+            hours = max(1, int(gap_seconds // 3600))
+            return f"{hours}小时"
+        days = max(1, int(gap_seconds // 86400))
+        return f"{days}天"
+
+    async def _ensure_session_for_user(self, user_data: dict[str, Any]) -> Optional[dict[str, Any]]:
+        session_key = user_data.get('session_key')
+        if not session_key:
+            return None
+
+        existing = self._user_sessions.get(session_key)
+        if existing:
+            if 'lock' not in existing:
+                existing['lock'] = asyncio.Lock()
+            if not existing.get('sender_id'):
+                existing['sender_id'] = user_data.get('sender_id')
+            if 'is_group' not in existing:
+                existing['is_group'] = bool(user_data.get('is_group'))
+            if 'group_id' not in existing:
+                existing['group_id'] = user_data.get('group_id')
+            if not existing.get('user_title'):
+                existing['user_title'] = user_data.get('user_title') or f"QQ用户{user_data.get('sender_id') or ''}"
+            if 'permission_level' not in existing:
+                existing['permission_level'] = user_data.get('permission_level')
+            return existing
+
+        try:
+            from main_logic.omni_offline_client import OmniOfflineClient
+            from utils.config_manager import get_config_manager
+
+            config_manager = get_config_manager()
+            master_name, her_name, _, catgirl_data, _, lanlan_prompt_map, _, _, _ = config_manager.get_character_data()
+            current_character = catgirl_data.get(her_name, {})
+            character_prompt = lanlan_prompt_map.get(her_name, "你是一个友好的AI助手")
+            character_card_fields = {}
+            for key, value in current_character.items():
+                if key not in ['_reserved', 'voice_id', 'system_prompt', 'model_type',
+                               'live2d', 'vrm', 'vrm_animation', 'lighting', 'vrm_rotation',
+                               'live2d_item_id', 'item_id', 'idleAnimation']:
+                    if isinstance(value, (str, int, float, bool)) and value:
+                        character_card_fields[key] = value
+
+            conversation_config = config_manager.get_model_api_config('conversation')
+            base_url = conversation_config.get('base_url', '')
+            api_key = conversation_config.get('api_key', '')
+            model = conversation_config.get('model', '')
+
+            reply_chunks = []
+
+            async def on_text_delta(text: str, is_first: bool):
+                reply_chunks.append(text)
+
+            user_session = OmniOfflineClient(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                on_text_delta=on_text_delta
+            )
+
+            system_prompt, memory_enabled = await self._build_qq_session_instructions(
+                her_name=her_name,
+                master_name=master_name,
+                character_prompt=character_prompt,
+                character_card_fields=character_card_fields,
+                permission_level=str(user_data.get('permission_level') or 'trusted'),
+                sender_id=str(user_data.get('sender_id') or ''),
+                user_title=str(user_data.get('user_title') or f"QQ用户{user_data.get('sender_id') or ''}"),
+                is_group=bool(user_data.get('is_group')),
+                group_id=user_data.get('group_id'),
+            )
+            await user_session.connect(instructions=system_prompt)
+
+            created = {
+                'session': user_session,
+                'reply_chunks': reply_chunks,
+                'her_name': her_name,
+                'character_fields': character_card_fields,
+                'last_synced_index': 0,
+                'last_activity_at': time.time(),
+                'memory_enabled': memory_enabled,
+                'has_cached_memory': False,
+                'session_key': session_key,
+                'sender_id': str(user_data.get('sender_id') or ''),
+                'permission_level': str(user_data.get('permission_level') or 'trusted'),
+                'is_group': bool(user_data.get('is_group')),
+                'group_id': user_data.get('group_id'),
+                'user_title': str(user_data.get('user_title') or f"QQ用户{user_data.get('sender_id') or ''}"),
+                'user_nickname': user_data.get('user_nickname'),
+                'lock': asyncio.Lock(),
+                'last_proactive_at': 0.0,
+            }
+            self._user_sessions[session_key] = created
+            return created
+        except Exception as e:
+            self.logger.error(f"创建主动对话会话失败: {e}")
+            return None
+
+    async def _send_proactive_greeting(self, target: dict[str, Any]) -> bool:
+        session_data = await self._ensure_session_for_user(target)
+        if not session_data:
+            return False
+
+        gap_seconds = await self._fetch_last_conversation_gap(session_data['her_name'])
+        if gap_seconds is None:
+            gap_seconds = max(time.time() - float(session_data.get('last_activity_at') or 0.0), 0.0)
+
+        try:
+            from config.prompts_proactive import get_greeting_prompt, get_time_of_day_hint
+            from utils.language_utils import get_global_language
+        except Exception as e:
+            self.logger.error(f"加载主动问候提示词失败: {e}")
+            return False
+
+        lang = get_global_language()
+        template = get_greeting_prompt(gap_seconds, lang)
+        if not template:
+            self.logger.info("主动问候条件未满足，跳过发送")
+            return False
+
+        elapsed = self._format_elapsed_gap(gap_seconds)
+        instruction = template.format(
+            elapsed=elapsed,
+            name=session_data['her_name'],
+            master=session_data.get('user_title') or '主人',
+            time_hint=get_time_of_day_hint(lang),
+            holiday_hint='',
+        ) + "\n======QQ主动私聊约束======\n- 这是通过QQ发起的主动问候\n- 只输出最终要发送给对方的一小段自然中文\n- 不要使用Markdown、表情符号或多段长文\n- 如果不适合发消息，输出 [PASS]\n======约束结束======"
+
+        return await self._deliver_proactive_instruction(session_data, instruction)
+
+    async def _send_proactive_turn(self, target: dict[str, Any]) -> bool:
+        session_data = await self._ensure_session_for_user(target)
+        if not session_data:
+            return False
+
+        try:
+            from config.prompts_proactive import get_proactive_chat_prompt
+            from utils.language_utils import get_global_language
+        except Exception as e:
+            self.logger.error(f"加载主动对话提示词失败: {e}")
+            return False
+
+        lang = get_global_language()
+        prompt_template = get_proactive_chat_prompt('home', lang)
+        memory_context = await self._fetch_memory_context(session_data['her_name'])
+        trending_content = self._build_proactive_context_summary(session_data)
+        instruction = prompt_template.format(
+            memory_context=memory_context or '（暂无新的记忆补充）',
+            trending_content=trending_content,
+        ) + f"\n======QQ主动私聊约束======\n- 当前对象: {session_data.get('user_title') or '主人'}（QQ: {session_data.get('sender_id') or ''}）\n- 这是没有新用户输入时的主动搭话\n- 只输出最终要发送的一小段自然中文，尽量简短\n- 不要使用Markdown、表情符号，不要假装看到了QQ界面之外的信息\n- 如果现在不适合主动发言，输出 [PASS]\n======约束结束======"
+
+        return await self._deliver_proactive_instruction(session_data, instruction)
+
+    async def _deliver_proactive_instruction(self, session_data: dict[str, Any], instruction: str) -> bool:
+        if not self.qq_client:
+            return False
+
+        lock = session_data.setdefault('lock', asyncio.Lock())
+        session = session_data.get('session')
+        if not session:
+            return False
+
+        async with lock:
+            session_data['last_activity_at'] = time.time()
+            reply_chunks = session_data.get('reply_chunks') or []
+            reply_chunks.clear()
+            ok = await session.prompt_ephemeral(instruction)
+            if not ok:
+                return False
+            proactive_text = ''.join(reply_chunks).strip()
+            if not proactive_text or proactive_text == '[PASS]':
+                self.logger.info(f"主动对话未发送内容 (会话: {session_data.get('session_key')})")
+                return False
+
+            if session_data.get('is_group') and session_data.get('group_id'):
+                await self.qq_client.send_group_message(str(session_data['group_id']), proactive_text)
+            else:
+                await self.qq_client.send_message(str(session_data.get('sender_id') or ''), proactive_text)
+            session_data['last_proactive_at'] = time.time()
+            self.logger.info(f"主动消息发送成功 (会话: {session_data.get('session_key')}, length: {len(proactive_text)})")
+            return True
+
     async def _flush_idle_memory_sessions(self):
         now = time.time()
-        idle_users = []
-        for sender_id, user_data in list(self._user_sessions.items()):
+        idle_sessions = []
+        for session_key, user_data in list(self._user_sessions.items()):
             if not user_data.get('memory_enabled'):
                 continue
             last_activity_at = user_data.get('last_activity_at') or now
             if now - last_activity_at >= self.SESSION_IDLE_TIMEOUT_SECONDS:
-                idle_users.append(sender_id)
+                idle_sessions.append(session_key)
 
-        for sender_id in idle_users:
-            await self._finalize_user_memory_session(sender_id, reason="idle_timeout")
+        for session_key in idle_sessions:
+            await self._finalize_user_memory_session(session_key, reason="idle_timeout")
 
     async def _flush_all_memory_sessions(self, reason: str):
-        for sender_id, user_data in list(self._user_sessions.items()):
+        for session_key, user_data in list(self._user_sessions.items()):
             if user_data.get('memory_enabled'):
-                await self._finalize_user_memory_session(sender_id, reason=reason)
+                await self._finalize_user_memory_session(session_key, reason=reason)
 
     def _conversation_slice_to_memory_messages(self, conversation_history: list, start_index: int = 0) -> list[dict[str, Any]]:
         memory_messages = []
@@ -394,7 +735,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             response.raise_for_status()
             return response.json()
 
-    async def _cache_session_delta(self, sender_id: str, user_data: dict[str, Any]) -> int:
+    async def _cache_session_delta(self, session_key: str, user_data: dict[str, Any]) -> int:
         session = user_data.get('session')
         her_name = user_data.get('her_name')
         if not session or not her_name:
@@ -411,15 +752,15 @@ class QQAutoReplyPlugin(NekoPluginBase):
         user_data['has_cached_memory'] = True
         return len(delta_messages)
 
-    async def _finalize_user_memory_session(self, sender_id: str, reason: str) -> bool:
-        user_data = self._user_sessions.get(sender_id)
+    async def _finalize_user_memory_session(self, session_key: str, reason: str) -> bool:
+        user_data = self._user_sessions.get(session_key)
         if not user_data or not user_data.get('memory_enabled'):
             return False
 
         session = user_data.get('session')
         her_name = user_data.get('her_name')
         if not session or not her_name:
-            self._user_sessions.pop(sender_id, None)
+            self._user_sessions.pop(session_key, None)
             return False
 
         try:
@@ -431,19 +772,19 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 result = await self._post_memory_history('process', her_name, remaining_messages, timeout=30.0)
                 if result.get('status') == 'error':
                     raise RuntimeError(result.get('message', 'process failed'))
-                self.logger.info(f"[{reason}] 已为用户 {sender_id} 完成正式记忆结算，消息数: {len(remaining_messages)}")
+                self.logger.info(f"[{reason}] 已为用户 {session_key} 完成正式记忆结算，消息数: {len(remaining_messages)}")
             elif user_data.get('has_cached_memory'):
                 settled_messages = self._conversation_slice_to_memory_messages(conversation_history, 0)
                 result = await self._post_memory_history('settle', her_name, settled_messages, timeout=30.0)
                 if result.get('status') == 'error':
                     raise RuntimeError(result.get('message', 'settle failed'))
-                self.logger.info(f"[{reason}] 已为用户 {sender_id} 完成缓存记忆结算")
+                self.logger.info(f"[{reason}] 已为用户 {session_key} 完成缓存记忆结算")
 
             await session.close()
-            self._user_sessions.pop(sender_id, None)
+            self._user_sessions.pop(session_key, None)
             return True
         except Exception as e:
-            self.logger.error(f"[{reason}] 用户 {sender_id} 的记忆结算失败: {e}")
+            self.logger.error(f"[{reason}] 用户 {session_key} 的记忆结算失败: {e}")
             return False
 
 
@@ -516,6 +857,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 character_prompt
             ]
 
+            # TODO: i18n — 角色卡分隔标记、转述场景、relay_prompt 需国际化
             if character_card_fields:
                 system_prompt_parts.append("\n======角色卡额外设定======")
                 for field_name, field_value in character_card_fields.items():
@@ -565,6 +907,103 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self.logger.error(f"Failed to generate relay message: {e}")
 
 
+    async def _build_qq_session_instructions(
+        self,
+        her_name: str,
+        master_name: str,
+        character_prompt: str,
+        character_card_fields: dict,
+        permission_level: str,
+        sender_id: str,
+        user_title: str,
+        is_group: bool = False,
+        group_id: Optional[str] = None,
+    ) -> tuple[str, bool]:
+        """构建 QQ 会话初始化提示词，复用 N.E.K.O 当前提示词链语义。"""
+        from config.prompts_sys import CONTEXT_SUMMARY_READY, SESSION_INIT_PROMPT
+        from utils.language_utils import get_global_language
+
+        try:
+            from utils.i18n_utils import normalize_language_code
+        except Exception:
+            normalize_language_code = None
+
+        user_language = get_global_language()
+        short_language = (
+            normalize_language_code(user_language, format='short')
+            if normalize_language_code else user_language
+        )
+
+        init_prompt_template = SESSION_INIT_PROMPT.get(
+            short_language,
+            SESSION_INIT_PROMPT.get(user_language, SESSION_INIT_PROMPT['zh'])
+        )
+        context_ready_template = CONTEXT_SUMMARY_READY.get(
+            short_language,
+            CONTEXT_SUMMARY_READY.get(user_language, CONTEXT_SUMMARY_READY['zh'])
+        )
+
+        system_prompt_parts = [
+            init_prompt_template.format(name=her_name),
+            character_prompt,
+        ]
+
+        memory_enabled = (not is_group and permission_level == "admin")
+        if memory_enabled:
+            try:
+                import httpx
+                from config import MEMORY_SERVER_PORT
+
+                async with httpx.AsyncClient(timeout=5.0, proxy=None, trust_env=False) as client:
+                    response = await client.get(f"http://127.0.0.1:{MEMORY_SERVER_PORT}/new_dialog/{her_name}")
+                    if response.is_success:
+                        memory_context = response.text.strip()
+                        if memory_context:
+                            system_prompt_parts.append(
+                                memory_context + context_ready_template.format(name=her_name, master=master_name)
+                            )
+                    else:
+                        self.logger.warning(f"读取 Memory Server 上下文失败: {response.status_code}")
+            except Exception as e:
+                self.logger.warning(f"读取 Memory Server 上下文失败: {e}")
+
+        # TODO: i18n — 角色卡分隔标记、群聊/私聊环境说明需国际化
+        if character_card_fields:
+            system_prompt_parts.append("\n======角色卡额外设定======")
+            for field_name, field_value in character_card_fields.items():
+                system_prompt_parts.append(f"{field_name}: {field_value}")
+            system_prompt_parts.append("======角色卡设定结束======")
+
+        if is_group:
+            system_prompt_parts.append(f"""
+======QQ 群聊环境======
+- 你正在 QQ 群 {group_id} 中与用户 {sender_id} 对话
+- 对方的称呼是：{user_title}
+- 这是群聊环境，有多个用户在场
+- 请保持角色设定，用简短自然的话回复（不超过50字）
+- 不要使用 Markdown 格式，不要使用表情符号
+- 记住你是 {her_name}，始终以 {her_name} 的身份回复
+- 在回复中自然地称呼对方为\"{user_title}\"
+- 注意不要重复之前的发言
+======环境说明结束======""")
+        else:
+            system_prompt_parts.append(f"""
+======QQ 私聊环境======
+- 你正在通过 QQ 与用户 {sender_id} 私聊
+- 对方的称呼是：{user_title}
+- 请保持角色设定，用简短自然的话回复（不超过50字）
+- 不要使用 Markdown 格式，不要使用表情符号
+- 记住你是 {her_name}，始终以 {her_name} 的身份回复
+- 在回复中自然地称呼对方为\"{user_title}\"
+- 注意不要重复之前的发言
+======环境说明结束======""")
+
+        system_prompt = "\n".join(system_prompt_parts)
+        self.logger.info(f"系统提示词长度: {len(system_prompt)} 字符")
+        self.logger.info(f"使用语言: {user_language}, 初始提示: {init_prompt_template[:50]}...")
+        return system_prompt, memory_enabled
+
+
     async def _generate_reply(
         self, message: str, permission_level: str, sender_id: str,
         is_group: bool = False, group_id: str = None, user_nickname: Optional[str] = None
@@ -578,8 +1017,6 @@ class QQAutoReplyPlugin(NekoPluginBase):
         try:
             from main_logic.omni_offline_client import OmniOfflineClient
             from utils.config_manager import get_config_manager
-            import httpx
-            from config import MEMORY_SERVER_PORT
 
             config_manager = get_config_manager()
 
@@ -617,6 +1054,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             current_character = catgirl_data.get(her_name, {})
 
             # 获取角色核心提示词（system_prompt）
+            # TODO: i18n — fallback prompt 需国际化
             character_prompt = lanlan_prompt_map.get(her_name, "你是一个友好的AI助手")
 
             # 获取角色卡的额外字段（如果有）
@@ -660,74 +1098,17 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     on_text_delta=on_text_delta
                 )
 
-                # 使用与前端完全一致的提示词结构
-                from config.prompts_sys import SESSION_INIT_PROMPT
-                from utils.language_utils import get_global_language
-
-                # 获取用户语言
-                user_language = get_global_language()
-
-                memory_context = ""
-                if not is_group and permission_level == "admin":
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0) as client:
-                            response = await client.get(f"http://localhost:{MEMORY_SERVER_PORT}/new_dialog/{her_name}")
-                            if response.status_code == 200:
-                                memory_context = response.text.strip()
-                            else:
-                                self.logger.warning(f"读取 Memory Server 上下文失败: {response.status_code}")
-                    except Exception as e:
-                        self.logger.warning(f"读取 Memory Server 上下文失败: {e}")
-
-                # 构建初始提示（与前端一致）
-                init_prompt = SESSION_INIT_PROMPT.get(user_language, SESSION_INIT_PROMPT['zh'])
-                init_prompt = init_prompt.format(name=her_name)
-
-                # 构建完整系统提示（与前端架构一致）
-                system_prompt_parts = [
-                    init_prompt,  # "你是一个角色扮演大师。请按要求扮演以下角色（{name}）。"
-                    character_prompt  # 角色核心提示词
-                ]
-
-                if memory_context:
-                    system_prompt_parts.append(memory_context)
-
-                # 注入角色卡额外字段
-                if character_card_fields:
-                    system_prompt_parts.append("\n======角色卡额外设定======")
-                    for field_name, field_value in character_card_fields.items():
-                        system_prompt_parts.append(f"{field_name}: {field_value}")
-                    system_prompt_parts.append("======角色卡设定结束======")
-
-                # 添加 QQ 对话特定说明
-                if is_group:
-                    system_prompt_parts.append(f"""
-======QQ 群聊环境======
-- 你正在 QQ 群 {group_id} 中与用户 {sender_id} 对话
-- 对方的称呼是：{user_title}
-- 这是群聊环境，有多个用户在场
-- 请保持角色设定，用简短自然的话回复（不超过50字）
-- 不要使用 Markdown 格式，不要使用表情符号
-- 记住你是 {her_name}，始终以 {her_name} 的身份回复
-- 在回复中自然地称呼对方为"{user_title}"
-- 注意不要重复之前的发言
-======环境说明结束======""")
-                else:
-                    system_prompt_parts.append(f"""
-======QQ 私聊环境======
-- 你正在通过 QQ 与用户 {sender_id} 私聊
-- 对方的称呼是：{user_title}
-- 请保持角色设定，用简短自然的话回复（不超过50字）
-- 不要使用 Markdown 格式，不要使用表情符号
-- 记住你是 {her_name}，始终以 {her_name} 的身份回复
-- 在回复中自然地称呼对方为"{user_title}“
-- 注意不要重复之前的发言
-======环境说明结束======""")
-
-                system_prompt = "\n".join(system_prompt_parts)
-
-                self.logger.info(f"系统提示词长度: {len(system_prompt)} 字符")
-                self.logger.info(f"使用语言: {user_language}, 初始提示: {init_prompt[:50]}...")
+                system_prompt, memory_enabled = await self._build_qq_session_instructions(
+                    her_name=her_name,
+                    master_name=master_name,
+                    character_prompt=character_prompt,
+                    character_card_fields=character_card_fields,
+                    permission_level=permission_level,
+                    sender_id=sender_id,
+                    user_title=user_title,
+                    is_group=is_group,
+                    group_id=group_id,
+                )
 
                 await user_session.connect(instructions=system_prompt)
 
@@ -738,8 +1119,17 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     'character_fields': character_card_fields,
                     'last_synced_index': 0,
                     'last_activity_at': time.time(),
-                    'memory_enabled': (not is_group and permission_level == "admin"),
+                    'memory_enabled': memory_enabled,
                     'has_cached_memory': False,
+                    'session_key': session_key,
+                    'sender_id': sender_id,
+                    'permission_level': permission_level,
+                    'is_group': is_group,
+                    'group_id': group_id,
+                    'user_title': user_title,
+                    'user_nickname': user_nickname,
+                    'lock': asyncio.Lock(),
+                    'last_proactive_at': 0.0,
                 }
 
             # 获取用户 session
@@ -748,20 +1138,29 @@ class QQAutoReplyPlugin(NekoPluginBase):
             reply_chunks = user_data['reply_chunks']
             her_name = user_data['her_name']
             user_data['last_activity_at'] = time.time()
+            user_data.setdefault('lock', asyncio.Lock())
+            user_data['session_key'] = session_key
+            user_data['sender_id'] = sender_id
+            user_data['permission_level'] = permission_level
+            user_data['is_group'] = is_group
+            user_data['group_id'] = group_id
+            user_data['user_title'] = user_title
+            user_data['user_nickname'] = user_nickname
 
-            reply_chunks.clear()
+            async with user_data['lock']:
+                reply_chunks.clear()
 
-            self.logger.info(f"发送消息到 AI (会话: {session_key}, length: {len(message)})")
-            await user_session.stream_text(message)
+                self.logger.info(f"发送消息到 AI (会话: {session_key}, length: {len(message)})")
+                await user_session.stream_text(message)
 
-            completed = await self._wait_session_response_complete(user_session)
-            if not completed:
-                self.logger.warning(f"会话 {session_key} 响应超时，关闭并丢弃该会话")
-                await user_session.close()
-                self._user_sessions.pop(session_key, None)
-                return None
+                completed = await self._wait_session_response_complete(user_session)
+                if not completed:
+                    self.logger.warning(f"会话 {session_key} 响应超时，关闭并丢弃该会话")
+                    await user_session.close()
+                    self._user_sessions.pop(session_key, None)
+                    return None
 
-            ai_reply = ''.join(reply_chunks).strip()
+                ai_reply = ''.join(reply_chunks).strip()
 
             if ai_reply:
                 if user_data.get('memory_enabled'):
@@ -1025,6 +1424,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             launcher_script = napcat_dir / "launcher.bat"
 
             if not launcher_script.exists():
+                self._manages_napcat_process = False
                 self.logger.warning(f"NapCat launcher not found: {launcher_script}")
                 return False
 
@@ -1058,6 +1458,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     stderr=asyncio.subprocess.DEVNULL,
                     startupinfo=startupinfo,
                 )
+            self._manages_napcat_process = True
 
             self.logger.info(f" NapCat started ({mode}模式, PID: {self._napcat_process.pid if self._napcat_process else 'N/A'})")
 
@@ -1120,7 +1521,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         """开启 QQ 服务器"""
         ready = await self._start_napcat(show_window=show_window)
         if not ready:
-            return Err(SdkError("START_ERROR: QQ 服务器未就绪"))
+            return Err(SdkError("START_ERROR: 未找到内置 NapCat，请先手动启动外部 NapCat/OneBot 后再使用 start_auto_reply"))
         return Ok({"status": "started", "show_window": bool(show_window), "ready": True})
 
     @plugin_entry(
@@ -1146,6 +1547,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
             except asyncio.CancelledError:
                 pass
             self._napcat_log_task = None
+        if not self._manages_napcat_process:
+            self.logger.info("当前为外部 OneBot/NapCat 模式，跳过 QQ/NapCat 进程关闭")
+            self._napcat_process = None
+            self._manages_napcat_process = False
+            return
 
         # 用 KillQQ.bat 终止 QQ 进程
         try:
@@ -1173,3 +1579,4 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self.logger.error(f"Failed to stop NapCat: {e}")
 
         self._napcat_process = None
+        self._manages_napcat_process = False
