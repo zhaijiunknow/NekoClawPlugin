@@ -24,7 +24,7 @@ class GroupPermissionManager:
                 group_id = group.get("group_id", "")
                 level = group.get("level", "normal")
                 if group_id:
-                    self._groups[group_id] = level
+                    self._groups[group_id] = level if level in ["trusted", "truth", "normal"] else "normal"
 
     def add_group(self, group_id: str, level: str = "normal"):
         """
@@ -32,9 +32,9 @@ class GroupPermissionManager:
 
         Args:
             group_id: 群号
-            level: 权限等级 (trusted, normal)
+            level: 权限等级 (trusted, truth, normal)
         """
-        if level not in ["trusted", "normal"]:
+        if level not in ["trusted", "truth", "normal"]:
             level = "normal"
         self._groups[group_id] = level
 
@@ -51,7 +51,7 @@ class GroupPermissionManager:
             group_id: 群号
 
         Returns:
-            权限等级: trusted, normal, none
+            权限等级: trusted, truth, normal, none
         """
         group_str = str(group_id)
         return self._groups.get(group_str, "none")
@@ -61,9 +61,9 @@ class GroupPermissionManager:
         return self.get_group_level(str(group_id)) == "trusted"
 
     def is_allowed_group(self, group_id: str) -> bool:
-        """检查群聊是否被允许（信任或普通）"""
+        """检查群聊是否被允许（信任、真心话或普通）"""
         level = self.get_group_level(str(group_id))
-        return level in ["trusted", "normal"]
+        return level in ["trusted", "truth", "normal"]
 
     def list_groups(self) -> List[Dict[str, str]]:
         """列出所有群聊"""

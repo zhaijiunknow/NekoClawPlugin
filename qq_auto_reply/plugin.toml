@@ -24,12 +24,14 @@ enabled = true
 auto_start = false
 
 [qq_auto_reply]
-onebot_url = "你的服务器"
+onebot_url = "ws://127.0.0.1:3001"
 token = "你的令牌"
 trusted_users = [
     { qq = "你的号", level = "admin" },
 ]
 trusted_groups = [
     { group_id = "你的群", level = "trusted" },
+    { group_id = "你的真心话群", level = "truth" },
 ]
 normal_relay_probability = 0.1
+truth_reply_probability = 0.1
