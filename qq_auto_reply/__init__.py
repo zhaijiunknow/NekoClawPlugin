@@ -175,6 +175,9 @@ class QQAutoReplyPlugin(NekoPluginBase):
             # 启动消息处理任务
             self._running = True
             self._message_task = asyncio.create_task(self._process_messages())
+            enabled, _ = self._load_proactive_settings()
+            if enabled:
+                await self._send_startup_proactive_greeting()
             if self._proactive_task is None or self._proactive_task.done():
                 self._proactive_task = asyncio.create_task(self._proactive_chat_loop())
 
@@ -327,15 +330,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
             if not is_at_bot:
                 self.logger.debug(f"Ignored group message without @: {group_id}")
                 return
-        elif group_level == "truth":
-            if random.random() > self._truth_reply_probability:
-                self.logger.debug(
-                    f"Truth reply not triggered (probability: {self._truth_reply_probability}, group: {group_id})"
-                )
-                return
-            self.logger.info(
-                f"Truth reply triggered for group {group_id}, user {sender_id} (probability: {self._truth_reply_probability})"
-            )
+        elif group_level == "open":
+            self.logger.debug(f"Open group message allowed without @: {group_id}")
 
         # 生成回复（群聊中不检查用户权限）
         reply_text = await self._generate_reply(
@@ -388,6 +384,21 @@ class QQAutoReplyPlugin(NekoPluginBase):
         interval_seconds = max(60.0, interval_minutes * 60.0)
         return enabled, interval_seconds
 
+    async def _send_startup_proactive_greeting(self) -> bool:
+        target = self._select_proactive_target()
+        if not target:
+            self.logger.info("主动问候跳过：未找到 admin QQ 目标")
+            self._last_proactive_enabled = True
+            return False
+
+        sent = await self._send_proactive_greeting(target, force=True)
+        self._last_proactive_enabled = True
+        if sent:
+            now = time.time()
+            self._last_proactive_greeting_at = now
+            self._last_proactive_send_at = now
+        return sent
+
     async def _proactive_chat_loop(self):
         try:
             while True:
@@ -438,13 +449,21 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if self.permission_mgr:
             nickname = self.permission_mgr.get_nickname(admin_qq)
 
+        try:
+            from utils.config_manager import get_config_manager
+
+            config_manager = get_config_manager()
+            master_name, _, _, _, _, _, _, _, _ = config_manager.get_character_data()
+        except Exception:
+            master_name = None
+
         return {
             'session_key': session_key,
             'sender_id': admin_qq,
             'permission_level': 'admin',
             'is_group': False,
             'group_id': None,
-            'user_title': '主人',
+            'user_title': master_name if master_name else f'QQ用户{admin_qq}',
             'user_nickname': nickname,
             'memory_enabled': True,
         }
@@ -603,7 +622,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
             self.logger.error(f"创建主动对话会话失败: {e}")
             return None
 
-    async def _send_proactive_greeting(self, target: dict[str, Any]) -> bool:
+    async def _send_proactive_greeting(self, target: dict[str, Any], force: bool = False) -> bool:
         session_data = await self._ensure_session_for_user(target)
         if not session_data:
             return False
@@ -621,6 +640,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
         lang = get_global_language()
         template = get_greeting_prompt(gap_seconds, lang)
+        if not template and force:
+            from config.prompts_proactive import GREETING_PROMPT_SHORT
+            lang_key = lang if lang in GREETING_PROMPT_SHORT else 'zh'
+            template = GREETING_PROMPT_SHORT.get(lang_key, GREETING_PROMPT_SHORT['zh'])
         if not template:
             self.logger.info("主动问候条件未满足，跳过发送")
             return False
@@ -629,10 +652,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
         instruction = template.format(
             elapsed=elapsed,
             name=session_data['her_name'],
-            master=session_data.get('user_title') or '主人',
+            master=session_data.get('user_title') or f"QQ用户{session_data.get('sender_id') or ''}",
             time_hint=get_time_of_day_hint(lang),
             holiday_hint='',
-        ) + "\n======QQ主动私聊约束======\n- 这是通过QQ发起的主动问候\n- 只输出最终要发送给对方的一小段自然中文\n- 不要使用Markdown、表情符号或多段长文\n- 如果不适合发消息，输出 [PASS]\n======约束结束======"
+        ) + "\n======QQ发送约束======\n- 这是通过QQ私聊发送的消息\n- 只输出最终要发送给对方的话\n- 不要使用Markdown、表情符号或多段长文\n- 如果不适合发送，输出 [PASS]\n======约束结束======"
 
         return await self._deliver_proactive_instruction(session_data, instruction)
 
@@ -649,13 +672,19 @@ class QQAutoReplyPlugin(NekoPluginBase):
             return False
 
         lang = get_global_language()
+        from utils.config_manager import get_config_manager
+        config_manager = get_config_manager()
+        master_name, her_name, _, _, _, _, _, _, _ = config_manager.get_character_data()
         prompt_template = get_proactive_chat_prompt('home', lang)
         memory_context = await self._fetch_memory_context(session_data['her_name'])
         trending_content = self._build_proactive_context_summary(session_data)
+        current_target = session_data.get('user_title') or f"QQ用户{session_data.get('sender_id') or ''}"
         instruction = prompt_template.format(
+            lanlan_name=her_name,
+            master_name=session_data.get('user_title') or master_name or f"QQ用户{session_data.get('sender_id') or ''}",
             memory_context=memory_context or '（暂无新的记忆补充）',
             trending_content=trending_content,
-        ) + f"\n======QQ主动私聊约束======\n- 当前对象: {session_data.get('user_title') or '主人'}（QQ: {session_data.get('sender_id') or ''}）\n- 这是没有新用户输入时的主动搭话\n- 只输出最终要发送的一小段自然中文，尽量简短\n- 不要使用Markdown、表情符号，不要假装看到了QQ界面之外的信息\n- 如果现在不适合主动发言，输出 [PASS]\n======约束结束======"
+        ) + f"\n======QQ主动私聊约束======\n- 当前对象: {current_target}（QQ: {session_data.get('sender_id') or ''}）\n- 这是没有新用户输入时的主动搭话\n- 只输出最终要发送的一小段自然中文，尽量简短\n- 不要使用Markdown、表情符号，不要假装看到了QQ界面之外的信息\n- 如果现在不适合主动发言，输出 [PASS]\n======约束结束======"
 
         return await self._deliver_proactive_instruction(session_data, instruction)
 
@@ -932,6 +961,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         group_id: Optional[str] = None,
         use_memory_context: Optional[bool] = None,
         address_user_by_name: bool = True,
+        group_facing: bool = False,
     ) -> tuple[str, bool]:
         """构建 QQ 会话初始化提示词，复用 N.E.K.O 当前提示词链语义。"""
         from config.prompts_sys import CONTEXT_SUMMARY_READY, SESSION_INIT_PROMPT
@@ -992,13 +1022,44 @@ class QQAutoReplyPlugin(NekoPluginBase):
             system_prompt_parts.append("======角色卡设定结束======")
 
         if is_group:
-            naming_instruction = (
-                f'- 在回复中自然地称呼对方为"{user_title}"'
-                if address_user_by_name else
-                '- 不要直接称呼对方名字、昵称或QQ号，只针对当前话题自然回应'
-            )
-            title_line = f"- 对方的称呼是：{user_title}\n" if address_user_by_name else ""
-            system_prompt_parts.append(f"""
+            if group_facing:
+                system_prompt_parts.append(f"""
+======身份定义======
+- 你自己：{her_name}，你是当前回复者
+- 主人/管理员：{master_name if master_name else '主人'}，是固定身份，不等于群内任意成员
+- 当前发言场景：QQ群 {group_id} 的群发消息，面向整个群体
+- 当前消息对象是群内成员整体，不是某一个单独用户
+- 即使群号、QQ号、用户昵称、主人名字、你的名字或角色设定中的人物名称相同，也必须按上述身份定义区分，绝不能混淆角色
+======身份定义结束======
+
+======QQ 群聊环境======
+- 你正在 QQ 群 {group_id} 中向群内成员发言
+- 这是群聊环境，有多个用户在场
+- 这次回复应面向整个群体，而不是某个单独用户
+- 默认使用“大家”“各位”“群友们”等集体称呼
+- 不要把群号、QQ号或单个用户当成人名来称呼
+- 除非消息内容明确需要，否则不要点名某个具体用户
+- 请保持角色设定，用简短自然的话回复（不超过50字）
+- 不要使用 Markdown 格式，不要使用表情符号
+- 记住你是 {her_name}，始终以 {her_name} 的身份回复
+- 注意不要重复之前的发言
+======环境说明结束======""")
+            else:
+                naming_instruction = (
+                    f'- 在回复中自然地称呼对方为"{user_title}"'
+                    if address_user_by_name else
+                    '- 不要直接称呼对方名字、昵称或QQ号，只针对当前话题自然回应'
+                )
+                title_line = f"- 当前发言人的称呼是：{user_title}\n" if address_user_by_name else ""
+                system_prompt_parts.append(f"""
+======身份定义======
+- 你自己：{her_name}，你是当前回复者
+- 主人/管理员：{master_name if master_name else '主人'}，是固定身份，不等于当前发言人
+- 当前发言人：{user_title}（QQ: {sender_id}），是本轮群聊中正在对话的对象
+- 当前发言人不是你自己，也不是主人/管理员，除非系统另有明确说明
+- 即使当前发言人的名字、QQ昵称、主人名字、你的名字或角色设定中的人物名称相同，也必须按上述身份定义区分，绝不能混淆角色
+======身份定义结束======
+
 ======QQ 群聊环境======
 - 你正在 QQ 群 {group_id} 中与用户 {sender_id} 对话
 {title_line}- 这是群聊环境，有多个用户在场
@@ -1009,7 +1070,22 @@ class QQAutoReplyPlugin(NekoPluginBase):
 - 注意不要重复之前的发言
 ======环境说明结束======""")
         else:
+            friend_note = (
+                f"- 当前对话对象是{master_name if master_name else '主人'}的朋友，不是主人本人\n"
+                if permission_level != "admin" else ""
+            )
+            private_identity_target = (
+                f"- 当前对话对象：{user_title}（QQ: {sender_id}），这是当前私聊对象\n"
+                if permission_level != "admin" else
+                f"- 当前对话对象：{user_title}（QQ: {sender_id}），这就是主人/管理员本人\n"
+            )
             system_prompt_parts.append(f"""
+======身份定义======
+- 你自己：{her_name}，你是当前回复者
+- 主人/管理员：{master_name if master_name else '主人'}，是固定身份
+{private_identity_target}{friend_note}- 即使当前对话对象的名字、QQ昵称、主人名字、你的名字或角色设定中的人物名称相同，也必须按上述身份定义区分，绝不能混淆角色
+======身份定义结束======
+
 ======QQ 私聊环境======
 - 你正在通过 QQ 与用户 {sender_id} 私聊
 - 对方的称呼是：{user_title}
@@ -1030,7 +1106,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self, message: str, permission_level: str, sender_id: str,
         is_group: bool = False, group_id: str = None, user_nickname: Optional[str] = None,
         use_memory_context: Optional[bool] = None, persist_memory: Optional[bool] = None,
-        ephemeral_session: bool = False,
+        ephemeral_session: bool = False, group_facing: bool = False,
     ) -> Optional[str]:
         """生成回复内容（使用 OmniOfflineClient + 可选 Memory Server 同步）"""
         # 私聊：只为 admin 和 trusted 用户生成 AI 回复
@@ -1144,7 +1220,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     is_group=is_group,
                     group_id=group_id,
                     use_memory_context=should_use_memory_context,
-                    address_user_by_name=not (is_group and permission_level == "truth"),
+                    address_user_by_name=not (is_group and permission_level == "open"),
+                    group_facing=group_facing,
                 )
 
                 await user_session.connect(instructions=system_prompt)
@@ -1296,10 +1373,49 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if not self.qq_client.ws:
             raise RuntimeError("OneBot 未连接，请先启动自动回复")
 
+    def _resolve_private_message_target(self, target: str) -> tuple[str, Optional[str]]:
+        normalized = self._normalize_target_id(target)
+        if not normalized:
+            raise ValueError("target 不能为空")
+        if normalized.isdigit():
+            return normalized, None
+        if not self.permission_mgr:
+            raise RuntimeError("权限管理器未初始化")
+
+        matches = self.permission_mgr.find_users_by_nickname(normalized)
+        if not matches:
+            raise ValueError(f"NICKNAME_NOT_FOUND: 昵称 {normalized} 不在信任用户列表中")
+        if len(matches) > 1:
+            qq_list = ", ".join(user["qq"] for user in matches)
+            raise ValueError(f"NICKNAME_AMBIGUOUS: 昵称 {normalized} 匹配到多个用户: {qq_list}")
+        return matches[0]["qq"], normalized
+
+    async def _send_private_message_impl(self, target_qq: str, outbound_prompt: str, *, resolved_nickname: Optional[str] = None, raw_target: Optional[str] = None):
+        self._ensure_qq_client_connected()
+        ai_reply = await self._generate_reply(
+            outbound_prompt,
+            "admin",
+            target_qq,
+            is_group=False,
+            use_memory_context=True,
+            persist_memory=False,
+            ephemeral_session=True,
+        )
+        if not ai_reply:
+            return Err(SdkError("AI_EMPTY: AI 未生成可发送的私聊内容"))
+        await self.qq_client.send_message(target_qq, ai_reply)
+        self.logger.info(f"Sent AI private message to {target_qq} (length: {len(ai_reply)})")
+        result = {"qq_number": target_qq, "prompt": outbound_prompt, "message": ai_reply}
+        if raw_target:
+            result["target"] = raw_target
+        if resolved_nickname:
+            result["nickname"] = resolved_nickname
+        return Ok(result)
+
     @plugin_entry(
         id="send_private_message",
-        name="发送私聊消息",
-        description="向指定 QQ 号发送一条私聊消息。",
+        name="按QQ号发送私聊",
+        description="向指定 QQ 号发送一条私聊消息。必须提供 qq_number。",
         input_schema={
             "type": "object",
             "properties": {
@@ -1320,21 +1436,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         try:
             target_qq = self._validate_target_id(qq_number, field_name="qq_number")
             outbound_prompt = self._validate_outbound_message(message)
-            self._ensure_qq_client_connected()
-            ai_reply = await self._generate_reply(
-                outbound_prompt,
-                "admin",
-                target_qq,
-                is_group=False,
-                use_memory_context=True,
-                persist_memory=False,
-                ephemeral_session=True,
-            )
-            if not ai_reply:
-                return Err(SdkError("AI_EMPTY: AI 未生成可发送的私聊内容"))
-            await self.qq_client.send_message(target_qq, ai_reply)
-            self.logger.info(f"Sent AI private message to {target_qq} (length: {len(ai_reply)})")
-            return Ok({"qq_number": target_qq, "prompt": outbound_prompt, "message": ai_reply})
+            return await self._send_private_message_impl(target_qq, outbound_prompt, raw_target=qq_number)
         except ValueError as e:
             return Err(SdkError(f"INVALID_ARGUMENT: {e}"))
         except RuntimeError as e:
@@ -1342,6 +1444,44 @@ class QQAutoReplyPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.error(f"Failed to send AI private message: {e}")
             return Err(SdkError(f"SEND_FAILED: 发送 AI 私聊消息失败: {e}"))
+
+    @plugin_entry(
+        id="send_private_message_by_nickname",
+        name="按昵称发送私聊",
+        description="向已配置昵称的用户发送一条私聊消息。必须提供 nickname。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "nickname": {
+                    "type": "string",
+                    "description": "trusted_users 中已配置的昵称",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "要发送的消息内容",
+                },
+            },
+            "required": ["nickname", "message"],
+        },
+    )
+    async def send_private_message_by_nickname(self, nickname: str, message: str, **_):
+        """通过插件面板生成 AI 私聊消息并按昵称发送到指定用户"""
+        try:
+            target_qq, resolved_nickname = self._resolve_private_message_target(nickname)
+            outbound_prompt = self._validate_outbound_message(message)
+            return await self._send_private_message_impl(
+                target_qq,
+                outbound_prompt,
+                resolved_nickname=resolved_nickname,
+                raw_target=nickname,
+            )
+        except ValueError as e:
+            return Err(SdkError(f"INVALID_ARGUMENT: {e}"))
+        except RuntimeError as e:
+            return Err(SdkError(f"SEND_NOT_READY: {e}"))
+        except Exception as e:
+            self.logger.error(f"Failed to send AI private message by nickname: {e}")
+            return Err(SdkError(f"SEND_FAILED: 按昵称发送 AI 私聊消息失败: {e}"))
 
     @plugin_entry(
         id="send_group_message",
@@ -1377,6 +1517,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 use_memory_context=False,
                 persist_memory=False,
                 ephemeral_session=True,
+                group_facing=True,
             )
             if not ai_reply:
                 return Err(SdkError("AI_EMPTY: AI 未生成可发送的群聊内容"))
@@ -1535,7 +1676,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 },
                 "level": {
                     "type": "string",
-                    "description": "权限等级: trusted, truth, normal",
+                    "description": "权限等级: trusted, open, normal",
                     "default": "normal",
                 },
             },

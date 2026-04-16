@@ -25,13 +25,16 @@ auto_start = false
 
 [qq_auto_reply]
 onebot_url = "ws://127.0.0.1:3001"
-token = "你的令牌"
+token = "your_token_here"
 trusted_users = [
-    { qq = "你的号", level = "admin" },
+    { qq = "123455555", level = "admin" },
+    { qq = "123456789", level = "trusted", nickname = "狗狗" },
+    { qq = "987654321", level = "normal" },
 ]
 trusted_groups = [
-    { group_id = "你的群", level = "trusted" },
-    { group_id = "你的真心话群", level = "truth" },
+    { group_id = "146678866", level = "trusted" },
+    { group_id = "258369147", level = "open" },
+    { group_id = "123456789", level = "normal" },
 ]
 normal_relay_probability = 0.1
 truth_reply_probability = 0.1

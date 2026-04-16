@@ -6,11 +6,11 @@
 
 - **OneBot 协议支持**：利用 NapCat 的 OneBot 实现
 - **多级权限管理**：支持 admin、trusted、normal 三级用户权限
-- **群聊权限控制**：支持 trusted、truth、normal 三级群聊权限
+- **群聊权限控制**：支持 trusted、open、normal 三级群聊权限
 - **AI 对话集成**：使用 OmniOfflineClient 生成智能回复
 - **记忆系统同步**：管理员对话自动同步到 Memory Server
 - **转述功能**：普通用户消息可概率转述给管理员
-- **真心话群模式**：可在未 @ 机器人的情况下按概率接话，复用临时上下文和人设卡
+- **开放群模式**：可在未 @ 机器人的情况下直接接话，复用临时上下文和人设卡
 - **昵称管理**：支持为用户设置自定义称呼
 - **断线自动重连**：WebSocket 断开后指数退避自动重连（1s → 2s → … 最长 30s）
 
@@ -60,14 +60,14 @@ trusted_users = [
 # 信任群聊列表
 trusted_groups = [
     { group_id = "146678866", level = "trusted" },
-    { group_id = "258369147", level = "truth" },
+    { group_id = "258369147", level = "open" },
     { group_id = "123456789", level = "normal" },
 ]
 
 # Normal 权限转述概率（0.0-1.0）
 normal_relay_probability = 0.1
 
-# truth 群聊直接回复概率（0.0-1.0）
+# open 群聊直接回复概率（0.0-1.0）
 truth_reply_probability = 0.1
 ```
 
@@ -80,7 +80,7 @@ truth_reply_probability = 0.1
 | `trusted_users` | array | 信任用户列表，包含 QQ 号、权限等级和昵称 |
 | `trusted_groups` | array | 信任群聊列表，包含群号和权限等级 |
 | `normal_relay_probability` | float | 普通用户/普通群聊消息转述给管理员的概率 |
-| `truth_reply_probability` | float | `truth` 群聊在未 @ 机器人的情况下触发直接回复的概率 |
+| `truth_reply_probability` | float | `open` 群聊在未 @ 机器人的情况下触发直接回复的概率 |
 
 ## 权限等级
 
@@ -98,7 +98,7 @@ truth_reply_probability = 0.1
 | 等级 | 说明 | 行为 |
 |------|------|------|
 | `trusted` | 信任群聊 | 仅响应 @ 机器人的消息，生成 AI 回复 |
-| `truth` | 真心话群聊 | 无需 @，按概率直接接话；复用临时会话记忆与角色卡；不写入记忆库；不称呼发言人 |
+| `open` | 开放群聊 | 无需 @ 即可直接回复；复用临时会话记忆与角色卡；不写入记忆库；不称呼发言人 |
 | `normal` | 普通群聊 | 不响应 @，概率转述给管理员 |
 | `none` | 未授权 | 忽略消息 |
 
@@ -160,8 +160,8 @@ await plugin.set_user_nickname(qq_number="123456789", nickname="")
 # 添加信任群聊（响应 @）
 await plugin.add_trusted_group(group_id="985066274", level="trusted")
 
-# 添加真心话群聊（无需 @，按概率接话）
-await plugin.add_trusted_group(group_id="258369147", level="truth")
+# 添加开放群聊（无需 @ 直接回复）
+await plugin.add_trusted_group(group_id="258369147", level="open")
 
 # 添加普通群聊（仅转述）
 await plugin.add_trusted_group(group_id="123456789", level="normal")
@@ -237,7 +237,7 @@ INFO | [Plugin-qq_auto_reply] Auto reply started
 ```
 接收消息 → 检查群聊权限 → 根据权限处理
 ├─ trusted: 检查是否 @ 机器人 → 生成 AI 回复
-├─ truth:   无需 @ → 按 truth_reply_probability 概率直接回复
+├─ open:    无需 @ → 直接回复
 ├─ normal:  概率转述给管理员
 └─ none:    忽略
 ```
@@ -284,7 +284,7 @@ QQAutoReplyPlugin
 - 确认权限等级（normal 用户不会直接回复）
 - 查看日志确认消息是否被接收
 - `trusted` 群聊中确保 @ 了机器人
-- `truth` 群聊是概率触发，不是每条都会回复
+- `open` 群聊无需 @，配置正确时会直接回复
 
 ### 3. 记忆系统同步失败
 
@@ -293,7 +293,7 @@ QQAutoReplyPlugin
 **解决方案**：
 - 确认 Memory Server 正在运行
 - 注意：只有管理员的私聊对话才会同步记忆
-- 群聊（包括 `truth`）只保留临时上下文，不会写入记忆库
+- 群聊（包括 `open`）只保留临时上下文，不会写入记忆库
 
 ### 4. 转述功能不工作
 
