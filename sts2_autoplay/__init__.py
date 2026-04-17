@@ -148,10 +148,17 @@ class STS2AutoplayPlugin(NekoPluginBase):
         except Exception as e:
             return Err(str(e))
 
-    @plugin_entry(id="sts2_set_strategy", name="设置尖塔策略", description="设置尖塔自动游玩策略。", llm_result_fields=["summary"], input_schema={"type": "object", "properties": {"strategy": {"type": "string", "default": "heuristic"}}, "required": ["strategy"]})
-    async def sts2_set_strategy(self, strategy: str, **_):
+    @plugin_entry(id="sts2_set_mode", name="设置尖塔模式", description="设置尖塔自动游玩模式。支持 full-program / half-program / full-model。", llm_result_fields=["summary"], input_schema={"type": "object", "properties": {"mode": {"type": "string", "default": "half-program"}}, "required": ["mode"]})
+    async def sts2_set_mode(self, mode: str, **_):
         try:
-            return Ok(await self._service.set_strategy(strategy))
+            return Ok(await self._service.set_mode(mode))
+        except Exception as e:
+            return Err(str(e))
+
+    @plugin_entry(id="sts2_set_character_strategy", name="设置角色策略", description="设置角色策略名称。会按 strategies/<name>.md 在策略目录中匹配对应文档。", llm_result_fields=["summary"], input_schema={"type": "object", "properties": {"character_strategy": {"type": "string", "default": "defect"}}, "required": ["character_strategy"]})
+    async def sts2_set_character_strategy(self, character_strategy: str, **_):
+        try:
+            return Ok(await self._service.set_character_strategy(character_strategy))
         except Exception as e:
             return Err(str(e))
 

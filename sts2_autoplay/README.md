@@ -173,7 +173,11 @@ http://127.0.0.1:8765/mcp
 - `action_interval_seconds`：每个动作之间的额外间隔
 - `post_action_delay_seconds`：动作执行后等待局面稳定的间隔
 - `autoplay_on_start`：插件启动后是否自动开始游玩
-- `strategy`：当前策略，支持 `heuristic` 与 `defect`，其中 `defect` 会启用故障机器人（鸡煲）专用选牌逻辑
+- `mode`：当前自动游玩模式，固定支持 `full-program` / `全程序`、`half-program` / `半程序`、`full-model` / `全模型`
+  - `full-program`：纯程序启发式
+  - `half-program`：单次模型决策 + 程序合法性校验/回退
+  - `full-model`：两次模型调用（reasoning + final action）+ 中间程序检查 + 最终合法性验证
+- `character_strategy`：角色策略名称。会按 `strategies/<name>.md` 在策略目录里查找对应文档，支持用户自定义扩展；例如 `defect` 会匹配 `strategies/defect.md`
 - `max_consecutive_errors`：最大连续错误次数
 - `push_notifications`：历史保留字段
 - `event_stream_enabled`：预留字段，目前未实际启用
@@ -218,14 +222,21 @@ http://127.0.0.1:8765/mcp
 
 - `limit`：返回条数，默认 `20`
 
-### 11. `sts2_set_strategy`
-设置自动游玩策略。
+### 11. `sts2_set_mode`
+设置自动游玩模式。
 
 参数：
 
-- `strategy`：支持 `heuristic` 与 `defect`；`defect` 使用故障机器人（鸡煲）策略文档 `strategies/defect.md`，并会根据卡牌候选项动态调整选牌
+- `mode`：支持 `full-program` / `全程序`、`half-program` / `半程序`、`full-model` / `全模型`
 
-### 12. `sts2_set_speed`
+### 12. `sts2_set_character_strategy`
+设置角色策略名称。
+
+参数：
+
+- `character_strategy`：会经过名称标准化后匹配 `strategies/<name>.md`；例如 `defect` 会匹配 `strategies/defect.md`
+
+### 14. `sts2_set_speed`
 设置速度参数，并写回本地 `plugin.toml`。
 
 参数：
