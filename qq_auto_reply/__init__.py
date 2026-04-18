@@ -42,7 +42,15 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self._message_task: Optional[asyncio.Task] = None
         self._session_housekeeping_task: Optional[asyncio.Task] = None
         self._proactive_task: Optional[asyncio.Task] = None
+        self._handler_tasks: set[asyncio.Task] = set()
         self._user_sessions: dict[str, dict[str, Any]] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks_guard = asyncio.Lock()
+        self._max_concurrent_messages = 3
+        self._message_concurrency = asyncio.Semaphore(self._max_concurrent_messages)
+        self._ai_connect_timeout_seconds = 10.0
+        self._ai_turn_timeout_seconds = 60.0
+        self._handler_shutdown_timeout_seconds = 10.0
         self._last_proactive_enabled = False
         self._last_proactive_send_at = 0.0
         self._last_proactive_greeting_at = 0.0
@@ -75,6 +83,60 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if is_group:
             return f"group:{str(group_id or '').strip()}:{sender}"
         return f"private:{sender}"
+
+    def _message_session_key(self, message: Dict[str, Any]) -> Optional[str]:
+        message_type = str(message.get("message_type") or "").strip()
+        sender_id = str(message.get("user_id") or "").strip()
+        if not sender_id:
+            return None
+        if message_type == "private":
+            return self._build_session_key(sender_id=sender_id, is_group=False)
+        if message_type == "group":
+            group_id = str(message.get("group_id") or "").strip()
+            if not group_id:
+                return None
+            return self._build_session_key(sender_id=sender_id, is_group=True, group_id=group_id)
+        return None
+
+    async def _get_session_lock(self, session_key: str) -> asyncio.Lock:
+        async with self._session_locks_guard:
+            lock = self._session_locks.get(session_key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[session_key] = lock
+            return lock
+
+    def _track_handler_task(self, task: asyncio.Task) -> None:
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._on_handler_task_done)
+
+    def _on_handler_task_done(self, task: asyncio.Task) -> None:
+        self._handler_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.logger.error(f"Message handler task failed: {exc}")
+
+    async def _run_message_handler(self, message: Dict[str, Any]) -> None:
+        if not self._running:
+            return
+        session_key = self._message_session_key(message)
+        async with self._message_concurrency:
+            if session_key:
+                session_lock = await self._get_session_lock(session_key)
+                async with session_lock:
+                    if not self._running:
+                        return
+                    await self._handle_message(message)
+                return
+            await self._handle_message(message)
+
+    async def _run_with_session_lock(self, session_key: str, coro_factory) -> Any:
+        session_lock = await self._get_session_lock(session_key)
+        async with session_lock:
+            return await coro_factory()
 
     async def _wait_session_response_complete(self, session: Any, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
@@ -116,6 +178,11 @@ class QQAutoReplyPlugin(NekoPluginBase):
         # 获取转述概率
         self._normal_relay_probability = qq_cfg.get("normal_relay_probability", 0.1)
         self._truth_reply_probability = qq_cfg.get("truth_reply_probability", 0.1)
+        self._max_concurrent_messages = max(1, int(qq_cfg.get("max_concurrent_messages", 3) or 3))
+        self._message_concurrency = asyncio.Semaphore(self._max_concurrent_messages)
+        self._ai_connect_timeout_seconds = max(1.0, float(qq_cfg.get("ai_connect_timeout_seconds", 10.0) or 10.0))
+        self._ai_turn_timeout_seconds = max(5.0, float(qq_cfg.get("ai_turn_timeout_seconds", 60.0) or 60.0))
+        self._handler_shutdown_timeout_seconds = max(1.0, float(qq_cfg.get("handler_shutdown_timeout_seconds", 10.0) or 10.0))
 
         # 初始化 QQ 客户端
         onebot_url = qq_cfg.get("onebot_url", "ws://127.0.0.1:3001")
@@ -219,6 +286,19 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 pass
             self._message_task = None
 
+        if self._handler_tasks:
+            handler_tasks = list(self._handler_tasks)
+            for task in handler_tasks:
+                task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*handler_tasks, return_exceptions=True),
+                    timeout=self._handler_shutdown_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Timed out waiting for {len(handler_tasks)} message handler tasks to stop")
+            self._handler_tasks.clear()
+
         if self._proactive_task:
             self._proactive_task.cancel()
             try:
@@ -230,6 +310,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
         if self.qq_client:
             await self.qq_client.disconnect()
 
+        self._session_locks.clear()
+
         if stop_napcat:
             await self._stop_napcat()
 
@@ -239,7 +321,8 @@ class QQAutoReplyPlugin(NekoPluginBase):
             try:
                 message = await self.qq_client.receive_message()
                 if message:
-                    await self._handle_message(message)
+                    task = asyncio.create_task(self._run_message_handler(message))
+                    self._track_handler_task(task)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -595,7 +678,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 is_group=bool(user_data.get('is_group')),
                 group_id=user_data.get('group_id'),
             )
-            await user_session.connect(instructions=system_prompt)
+            await asyncio.wait_for(
+                user_session.connect(instructions=system_prompt),
+                timeout=self._ai_connect_timeout_seconds,
+            )
 
             created = {
                 'session': user_session,
@@ -728,12 +814,29 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 idle_sessions.append(session_key)
 
         for session_key in idle_sessions:
-            await self._finalize_user_memory_session(session_key, reason="idle_timeout")
+            async def _finalize_if_still_idle() -> bool:
+                current = self._user_sessions.get(session_key)
+                if not current or not current.get('memory_enabled'):
+                    return False
+                current_last_activity = current.get('last_activity_at') or now
+                if time.time() - current_last_activity < self.SESSION_IDLE_TIMEOUT_SECONDS:
+                    return False
+                return await self._finalize_user_memory_session(session_key, reason="idle_timeout")
+
+            await self._run_with_session_lock(session_key, _finalize_if_still_idle)
 
     async def _flush_all_memory_sessions(self, reason: str):
         for session_key, user_data in list(self._user_sessions.items()):
-            if user_data.get('memory_enabled'):
-                await self._finalize_user_memory_session(session_key, reason=reason)
+            if not user_data.get('memory_enabled'):
+                continue
+
+            async def _finalize_existing() -> bool:
+                current = self._user_sessions.get(session_key)
+                if not current or not current.get('memory_enabled'):
+                    return False
+                return await self._finalize_user_memory_session(session_key, reason=reason)
+
+            await self._run_with_session_lock(session_key, _finalize_existing)
 
     def _conversation_slice_to_memory_messages(self, conversation_history: list, start_index: int = 0) -> list[dict[str, Any]]:
         memory_messages = []
@@ -847,6 +950,7 @@ class QQAutoReplyPlugin(NekoPluginBase):
         self.logger.info(f"Relay triggered for {source_type} {source_id}, user {sender_id}")
 
         # 生成转述给主人的回复
+        temp_session = None
         try:
             from main_logic.omni_offline_client import OmniOfflineClient
             from utils.config_manager import get_config_manager
@@ -919,16 +1023,21 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
             system_prompt = "\n".join(system_prompt_parts)
 
-            await temp_session.connect(instructions=system_prompt)
+            await asyncio.wait_for(
+                temp_session.connect(instructions=system_prompt),
+                timeout=self._ai_connect_timeout_seconds,
+            )
 
             # 发送转述请求
             relay_prompt = f"请把这个内容转述给{master_name if master_name else '主人'}：{message_text}"
-            await temp_session.stream_text(relay_prompt)
+            await asyncio.wait_for(
+                temp_session.stream_text(relay_prompt),
+                timeout=self._ai_turn_timeout_seconds,
+            )
 
             completed = await self._wait_session_response_complete(temp_session)
             if not completed:
                 self.logger.warning("Relay generation timed out; closing temporary session")
-                await temp_session.close()
                 return
 
             relay_text = ''.join(reply_chunks).strip()
@@ -941,11 +1050,16 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 except Exception as e:
                     self.logger.error(f"Failed to relay to admin: {e}")
 
-            # 断开临时会话
-            await temp_session.close()
-
+        except asyncio.TimeoutError:
+            self.logger.warning(f"Relay generation timed out for {source_type} {source_id}, user {sender_id}")
         except Exception as e:
             self.logger.error(f"Failed to generate relay message: {e}")
+        finally:
+            if temp_session:
+                try:
+                    await temp_session.close()
+                except Exception as close_error:
+                    self.logger.warning(f"Failed to close temporary relay session: {close_error}")
 
 
     async def _build_qq_session_instructions(
@@ -1224,7 +1338,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
                     group_facing=group_facing,
                 )
 
-                await user_session.connect(instructions=system_prompt)
+                await asyncio.wait_for(
+                user_session.connect(instructions=system_prompt),
+                timeout=self._ai_connect_timeout_seconds,
+            )
 
                 self._user_sessions[session_key] = {
                     'session': user_session,
@@ -1270,7 +1387,10 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 reply_chunks.clear()
 
                 self.logger.info(f"发送消息到 AI (会话: {session_key}, length: {len(message)})")
-                await user_session.stream_text(message)
+                await asyncio.wait_for(
+                    user_session.stream_text(message),
+                    timeout=self._ai_turn_timeout_seconds,
+                )
 
                 completed = await self._wait_session_response_complete(user_session)
                 if not completed:
@@ -1303,6 +1423,16 @@ class QQAutoReplyPlugin(NekoPluginBase):
                 self.logger.warning("AI 未生成回复")
                 return f"收到你的消息: {message}"
 
+        except asyncio.TimeoutError:
+            self.logger.warning(f"会话 {session_key} 处理超时，关闭并丢弃该会话")
+            user_data = self._user_sessions.pop(session_key, None)
+            session = user_data.get('session') if user_data else None
+            if session:
+                try:
+                    await session.close()
+                except Exception as close_error:
+                    self.logger.warning(f"关闭超时会话失败: {close_error}")
+            return None
         except Exception as e:
             self.logger.exception(f"AI 生成回复失败: {e}")
             return f"收到你的消息: {message}"
@@ -1342,10 +1472,14 @@ class QQAutoReplyPlugin(NekoPluginBase):
 
     async def _invalidate_private_session(self, qq_number: str) -> None:
         session_key = self._build_session_key(sender_id=qq_number, is_group=False)
-        user_data = self._user_sessions.pop(session_key, None)
-        session = user_data.get("session") if user_data else None
-        if session:
-            await session.close()
+
+        async def _invalidate() -> None:
+            user_data = self._user_sessions.pop(session_key, None)
+            session = user_data.get("session") if user_data else None
+            if session:
+                await session.close()
+
+        await self._run_with_session_lock(session_key, _invalidate)
 
     @staticmethod
     def _normalize_target_id(target_id: str) -> str:

@@ -344,13 +344,50 @@ class STS2AutoplayService:
         if action_type in {"choose_reward_card", "select_deck_card"}:
             template_raw.pop("option_index", None)
         kwargs = self._normalize_action_kwargs(action_type, template_raw, context)
-        return {
+        prepared = {
             "action": action,
             "action_type": action_type,
             "kwargs": kwargs,
             "fingerprint": self._action_fingerprint(action),
             "context_signature": context["signature"],
+            "context": context,
         }
+        self._log_prepared_action(prepared, context)
+        return prepared
+
+    def _log_action_decision(self, source: str, action: dict[str, Any], context: dict[str, Any]) -> None:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        screen = snapshot.get("screen") or snapshot.get("normalized_screen") or "unknown"
+        self.logger.info(
+            f"[sts2_autoplay][decision] source={source} screen={screen} action={self._summarize_action(action, context)} available_actions={self._summarize_actions(context)}"
+        )
+
+    def _log_prepared_action(self, prepared: dict[str, Any], context: dict[str, Any]) -> None:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        screen = snapshot.get("screen") or snapshot.get("normalized_screen") or "unknown"
+        self.logger.info(
+            f"[sts2_autoplay][prepared] screen={screen} prepared={{'action_type': {prepared.get('action_type')!r}, 'kwargs': {prepared.get('kwargs')!r}, 'fingerprint': {prepared.get('fingerprint')!r}}} action={self._summarize_action(prepared.get('action'), context)} available_actions={self._summarize_actions(context)}"
+        )
+
+    def _summarize_action(self, action: Any, context: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(action, dict):
+            return {}
+        raw = action.get("raw") if isinstance(action.get("raw"), dict) else {}
+        action_type = str(action.get("type") or raw.get("type") or raw.get("name") or raw.get("action") or "")
+        return {
+            "type": action_type,
+            "label": action.get("label") or raw.get("label") or raw.get("description") or raw.get("name") or "",
+            "raw": {
+                key: value
+                for key, value in raw.items()
+                if key in {"name", "type", "option_index", "index", "card_index", "target_index", "requires_index", "requires_target"}
+            },
+            "allowed_kwargs": self._allowed_kwargs_for_action(action_type, raw, context),
+        }
+
+    def _summarize_actions(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        actions = context.get("actions") if isinstance(context.get("actions"), list) else []
+        return [self._summarize_action(action, context) for action in actions if isinstance(action, dict)]
 
     async def _revalidate_prepared_action(self, prepared: dict[str, Any], context: dict[str, Any]) -> Optional[dict[str, Any]]:
         actions = context["actions"]
@@ -572,37 +609,85 @@ class STS2AutoplayService:
     async def _select_action(self, context: dict[str, Any]) -> dict[str, Any]:
         mode = self._configured_mode()
         actions = context.get("actions") if isinstance(context.get("actions"), list) else []
+        preemptive_action = self._select_preemptive_program_action(actions, context)
+        if preemptive_action is not None:
+            self._log_action_decision(f"{mode}-program-preflight", preemptive_action, context)
+            return preemptive_action
         if mode == "full-program":
-            return self._select_action_heuristic(actions, context=context)
+            action = self._select_action_heuristic(actions, context=context)
+            self._log_action_decision("heuristic", action, context)
+            return action
         if mode == "half-program":
             try:
                 action = await self._select_action_with_llm(self._configured_character_strategy(), context)
                 if action is not None:
+                    self._log_action_decision("half-program-llm", action, context)
                     return action
             except Exception as exc:
                 self.logger.warning(f"半程序模式决策失败，回退全程序: {exc}")
-            return self._select_action_heuristic(actions, context=context)
+            action = self._select_action_heuristic(actions, context=context)
+            self._log_action_decision("half-program-heuristic-fallback", action, context)
+            return action
         if mode == "full-model":
             try:
                 action = await self._select_action_full_model(context)
                 if action is not None:
+                    self._log_action_decision("full-model", action, context)
                     return action
             except Exception as exc:
                 self.logger.warning(f"全模型模式决策失败，回退半程序: {exc}")
             try:
                 action = await self._select_action_with_llm(self._configured_character_strategy(), context)
                 if action is not None:
+                    self._log_action_decision("full-model-half-program-fallback", action, context)
                     return action
             except Exception as exc:
                 self.logger.warning(f"全模型回退半程序失败，继续回退全程序: {exc}")
-            return self._select_action_heuristic(actions, context=context)
-        return self._select_action_heuristic(actions, context=context)
+            action = self._select_action_heuristic(actions, context=context)
+            self._log_action_decision("full-model-heuristic-fallback", action, context)
+            return action
+        action = self._select_action_heuristic(actions, context=context)
+        self._log_action_decision("heuristic", action, context)
+        return action
+
+    def _select_preemptive_program_action(self, actions: list[dict[str, Any]], context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        reward_action = self._select_reward_action_heuristic(actions, context)
+        if reward_action is not None:
+            return reward_action
+        return self._select_shop_remove_selection_action(actions, context)
+
+    def _select_shop_remove_selection_action(self, actions: list[dict[str, Any]], context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        screen = self._normalized_screen_name(snapshot)
+        if screen != "card_selection":
+            return None
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        selected = self._select_shop_remove_action(actions, context, shop)
+        if selected is not None:
+            return selected
+        remove_action = next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "select_deck_card"), None)
+        if not isinstance(remove_action, dict):
+            return None
+        remove_index = self._find_shop_remove_card_index(context)
+        if remove_index is None:
+            return None
+        selected = dict(remove_action)
+        raw = remove_action.get("raw") if isinstance(remove_action.get("raw"), dict) else {}
+        selected_raw = dict(raw)
+        selected_raw["option_index"] = remove_index
+        selected_raw["shop_remove_selection"] = True
+        selected["raw"] = selected_raw
+        return selected
 
     def _select_action_heuristic(self, actions: list[dict[str, Any]], *, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         active_context = context or {"snapshot": self._snapshot}
         reward_action = self._select_reward_action_heuristic(actions, active_context)
         if reward_action is not None:
             return reward_action
+        shop_action = self._select_shop_action_heuristic(actions, active_context)
+        if shop_action is not None:
+            return shop_action
         combat = self._combat_state(active_context)
         if combat:
             self._log_combat_block_fields(active_context)
@@ -643,6 +728,285 @@ class STS2AutoplayService:
                 return action
         return actions[0]
 
+    def _select_shop_action_heuristic(self, actions: list[dict[str, Any]], context: dict[str, Any]) -> Optional[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        if self._normalized_screen_name(snapshot) != "shop":
+            return None
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        buy_card_action = next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "buy_card"), None)
+        if isinstance(buy_card_action, dict):
+            preferred_shop_card_index = self._find_preferred_shop_card_index(context)
+            if preferred_shop_card_index is not None:
+                selected = dict(buy_card_action)
+                raw = buy_card_action.get("raw") if isinstance(buy_card_action.get("raw"), dict) else {}
+                selected_raw = dict(raw)
+                selected_raw["option_index"] = preferred_shop_card_index
+                selected["raw"] = selected_raw
+                return selected
+        buy_relic_action = next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "buy_relic"), None)
+        if isinstance(buy_relic_action, dict):
+            preferred_shop_relic_index = self._find_preferred_shop_relic_index(context)
+            if preferred_shop_relic_index is not None:
+                selected = dict(buy_relic_action)
+                raw = buy_relic_action.get("raw") if isinstance(buy_relic_action.get("raw"), dict) else {}
+                selected_raw = dict(raw)
+                selected_raw["option_index"] = preferred_shop_relic_index
+                selected["raw"] = selected_raw
+                return selected
+        buy_potion_action = next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "buy_potion"), None)
+        if isinstance(buy_potion_action, dict):
+            preferred_shop_potion_index = self._find_preferred_shop_potion_index(context)
+            if preferred_shop_potion_index is not None:
+                selected = dict(buy_potion_action)
+                raw = buy_potion_action.get("raw") if isinstance(buy_potion_action.get("raw"), dict) else {}
+                selected_raw = dict(raw)
+                selected_raw["option_index"] = preferred_shop_potion_index
+                selected["raw"] = selected_raw
+                return selected
+        remove_action = self._select_shop_remove_action(actions, context, shop)
+        if remove_action is not None:
+            return remove_action
+        return next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "close_shop_inventory"), None)
+
+    def _find_preferred_shop_card_index(self, context: dict[str, Any]) -> Optional[int]:
+        if self._configured_character_strategy() != "defect":
+            return None
+        shop_cards = self._shop_card_options(context)
+        if not shop_cards:
+            return None
+        best_option: Optional[dict[str, Any]] = None
+        best_score: Optional[int] = None
+        for option in shop_cards:
+            score = self._score_defect_card_option(option, context)
+            if best_score is None or score > best_score:
+                best_option = option
+                best_score = score
+        if best_option is None or best_score is None or best_score < 90:
+            return None
+        return int(best_option["index"])
+
+    def _find_preferred_shop_relic_index(self, context: dict[str, Any]) -> Optional[int]:
+        if self._configured_character_strategy() != "defect":
+            return None
+        shop_relics = self._shop_relic_options(context)
+        if not shop_relics:
+            return None
+        best_option: Optional[dict[str, Any]] = None
+        best_score: Optional[int] = None
+        for option in shop_relics:
+            score = self._score_defect_shop_relic_option(option, context)
+            if best_score is None or score > best_score:
+                best_option = option
+                best_score = score
+        if best_option is None or best_score is None or best_score < 22:
+            return None
+        return int(best_option["index"])
+
+    def _find_preferred_shop_potion_index(self, context: dict[str, Any]) -> Optional[int]:
+        if self._configured_character_strategy() != "defect":
+            return None
+        shop_potions = self._shop_potion_options(context)
+        if not shop_potions:
+            return None
+        potion_slots = self._potion_slots(context)
+        if potion_slots > 0 and len(self._potions(context)) >= potion_slots:
+            return None
+        best_option: Optional[dict[str, Any]] = None
+        best_score: Optional[int] = None
+        for option in shop_potions:
+            score = self._score_defect_shop_potion_option(option, context)
+            if best_score is None or score > best_score:
+                best_option = option
+                best_score = score
+        if best_option is None or best_score is None or best_score < 22:
+            return None
+        return int(best_option["index"])
+
+    def _select_shop_remove_action(self, actions: list[dict[str, Any]], context: dict[str, Any], shop: dict[str, Any]) -> Optional[dict[str, Any]]:
+        card_removal = shop.get("card_removal") if isinstance(shop.get("card_removal"), dict) else {}
+        if not bool(card_removal.get("available")) or not bool(card_removal.get("enough_gold")):
+            return None
+        remove_action = next((action for action in actions if isinstance(action, dict) and str(action.get("type") or "") == "select_deck_card"), None)
+        if not isinstance(remove_action, dict):
+            return None
+        remove_index = self._find_shop_remove_card_index(context)
+        if remove_index is None:
+            return None
+        selected = dict(remove_action)
+        raw = remove_action.get("raw") if isinstance(remove_action.get("raw"), dict) else {}
+        selected_raw = dict(raw)
+        selected_raw["option_index"] = remove_index
+        selected_raw["shop_remove_selection"] = True
+        selected["raw"] = selected_raw
+        return selected
+
+    def _find_shop_remove_card_index(self, context: dict[str, Any]) -> Optional[int]:
+        deck = self._run_deck_cards(context)
+        if not deck:
+            return None
+        removable_cards = [card for card in deck if self._is_shop_removable_card(card)]
+        if not removable_cards:
+            return None
+        scored_cards = [self._shop_remove_card_debug_entry(card, context) for card in removable_cards]
+        curse_cards = [entry for entry in scored_cards if entry["priority"] == 0]
+        if curse_cards:
+            selected = curse_cards[0]
+            return self._safe_int(selected.get("index"), None)
+        starter_cards = [entry for entry in scored_cards if entry["priority"] == 1]
+        if starter_cards:
+            selected = min(starter_cards, key=lambda entry: entry["score"])
+            return self._safe_int(selected.get("index"), None)
+        selected = min(scored_cards, key=lambda entry: entry["score"])
+        if selected["score"] >= 70:
+            return None
+        return self._safe_int(selected.get("index"), None)
+
+    def _shop_remove_card_debug_entry(self, card: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        score = self._score_defect_deck_card(card, context)
+        texts = sorted(self._card_option_texts(card))
+        name = str(card.get("name") or card.get("card_name") or (texts[0] if texts else ""))
+        return {
+            "index": self._safe_int(card.get("index"), -1),
+            "name": name,
+            "priority": self._shop_remove_priority(card),
+            "score": score,
+            "rarity": str(card.get("rarity") or ""),
+            "card_type": str(card.get("card_type") or card.get("type") or ""),
+            "removable": self._is_shop_removable_card(card),
+        }
+
+    def _is_shop_removable_card(self, card: dict[str, Any]) -> bool:
+        texts = self._card_option_texts(card)
+        if any(alias in text for text in texts for alias in self._shop_unremovable_card_aliases()):
+            return False
+        return not bool(card.get("unremovable") or card.get("cannot_remove"))
+
+    def _shop_unremovable_card_aliases(self) -> set[str]:
+        try:
+            constraints = self._load_strategy_constraints(self._configured_character_strategy())
+        except RuntimeError:
+            return set()
+        shop_preferences = constraints.get("shop_preferences") if isinstance(constraints, dict) else {}
+        card_preferences = shop_preferences.get("card") if isinstance(shop_preferences, dict) else {}
+        unremovable = card_preferences.get("unremovable") if isinstance(card_preferences, dict) else {}
+        aliases: set[str] = set()
+        for items in unremovable.values() if isinstance(unremovable, dict) else []:
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, str) and item.strip():
+                    aliases.add(item.strip().lower())
+        return aliases
+
+    def _shop_remove_priority(self, card: dict[str, Any]) -> int:
+        rarity = str(card.get("rarity") or "").strip().lower()
+        card_type = str(card.get("card_type") or card.get("type") or "").strip().lower()
+        if rarity == "curse":
+            return 0
+        if rarity == "basic" and card_type in {"attack", "skill"}:
+            return 1
+        return 2
+
+    def _shop_card_options(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        cards = shop.get("cards") if isinstance(shop.get("cards"), list) else []
+        options: list[dict[str, Any]] = []
+        for idx, item in enumerate(cards):
+            if not isinstance(item, dict) or not bool(item.get("is_stocked")) or not bool(item.get("enough_gold")):
+                continue
+            texts = self._card_option_texts(item)
+            if not texts:
+                continue
+            option_index = item.get("index", idx)
+            options.append({"index": int(option_index), "texts": texts, "raw": item})
+        return options
+
+    def _shop_relic_options(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        relics = shop.get("relics") if isinstance(shop.get("relics"), list) else []
+        return self._shop_named_options(relics)
+
+    def _shop_potion_options(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        potions = shop.get("potions") if isinstance(shop.get("potions"), list) else []
+        return self._shop_named_options(potions)
+
+    def _shop_named_options(self, items: list[Any]) -> list[dict[str, Any]]:
+        options: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict) or not bool(item.get("is_stocked")) or not bool(item.get("enough_gold")):
+                continue
+            texts = self._card_option_texts(item)
+            if not texts:
+                continue
+            option_index = item.get("index", idx)
+            options.append({"index": int(option_index), "texts": texts, "raw": item})
+        return options
+
+    def _run_deck_cards(self, context: dict[str, Any]) -> list[dict[str, Any]]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        deck = run.get("deck") if isinstance(run.get("deck"), list) else []
+        return [card for card in deck if isinstance(card, dict)]
+
+    def _score_defect_deck_card(self, card: dict[str, Any], context: dict[str, Any]) -> int:
+        option = {"texts": self._card_option_texts(card), "raw": card, "index": self._safe_int(card.get("index"), 0)}
+        base_score = self._score_defect_card_option(option, context)
+        card_type = str(card.get("card_type") or card.get("type") or "").strip().lower()
+        rarity = str(card.get("rarity") or "").strip().lower()
+        if rarity == "basic":
+            if card_type == "attack":
+                return min(base_score, 15)
+            if card_type == "skill":
+                return min(base_score, 25)
+        if rarity == "curse":
+            return -100
+        if rarity == "status":
+            return -80
+        return base_score
+
+    def _score_shop_named_option(self, option: dict[str, Any], context: dict[str, Any], item_type: str) -> int:
+        texts = option.get("texts") if isinstance(option.get("texts"), set) else set()
+        constraints = self._load_strategy_constraints(self._configured_character_strategy())
+        shop_preferences = constraints.get("shop_preferences") if isinstance(constraints, dict) else {}
+        bucket = shop_preferences.get(item_type) if isinstance(shop_preferences, dict) and isinstance(shop_preferences.get(item_type), dict) else {}
+        score = 0
+        for category, bonus in (("required", 36), ("high_priority", 22), ("low_priority", -20)):
+            entries = bucket.get(category) if isinstance(bucket.get(category), dict) else {}
+            for items in entries.values():
+                if any(alias in text for text in texts for alias in items if isinstance(alias, str)):
+                    score += bonus
+        conditional_entries = bucket.get("conditional") if isinstance(bucket.get("conditional"), dict) else {}
+        for entry in conditional_entries.values():
+            items = entry.get("items") if isinstance(entry, dict) else []
+            if any(alias in text for text in texts for alias in items if isinstance(alias, str)):
+                score += 10
+        return score
+
+    def _score_defect_shop_relic_option(self, option: dict[str, Any], context: dict[str, Any]) -> int:
+        return self._score_shop_named_option(option, context, "relic")
+
+    def _score_defect_shop_potion_option(self, option: dict[str, Any], context: dict[str, Any]) -> int:
+        return self._score_shop_named_option(option, context, "potion")
+
+    def _potion_slots(self, context: dict[str, Any]) -> int:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        run = raw_state.get("run") if isinstance(raw_state.get("run"), dict) else {}
+        for key in ("potion_slots", "potionSlotCount", "potion_capacity"):
+            value = self._safe_int(run.get(key), -1)
+            if value >= 0:
+                return value
+        return 3
+
     def _select_reward_action_heuristic(self, actions: list[dict[str, Any]], context: dict[str, Any]) -> Optional[dict[str, Any]]:
         reward_actions = [
             action for action in actions
@@ -658,12 +1022,18 @@ class STS2AutoplayService:
         claim_card_index = self._find_claimable_card_reward_index(context)
         claim_action = raw_by_type.get("claim_reward")
         if claim_card_index is not None and isinstance(claim_action, dict):
-            selected = dict(claim_action)
-            raw = claim_action.get("raw") if isinstance(claim_action.get("raw"), dict) else {}
-            selected_raw = dict(raw)
-            selected_raw["option_index"] = claim_card_index
-            selected["raw"] = selected_raw
-            return selected
+            claim_allowed = self._allowed_kwargs_for_action(
+                "claim_reward",
+                claim_action.get("raw") if isinstance(claim_action.get("raw"), dict) else {},
+                context,
+            ).get("option_index", [])
+            if not claim_allowed or claim_card_index in claim_allowed:
+                selected = dict(claim_action)
+                raw = claim_action.get("raw") if isinstance(claim_action.get("raw"), dict) else {}
+                selected_raw = dict(raw)
+                selected_raw["option_index"] = claim_card_index
+                selected["raw"] = selected_raw
+                return selected
         reward_action = reward_actions[0]
         raw = reward_action.get("raw") if isinstance(reward_action.get("raw"), dict) else {}
         if not self._is_card_reward_context(raw, context):
@@ -709,9 +1079,10 @@ class STS2AutoplayService:
 
     def _select_weighted_play_card(self, actions: list[dict[str, Any]], combat: dict[str, Any], tactical_summary: dict[str, Any], *, attack_weight: int, defense_weight: int) -> Optional[dict[str, Any]]:
         target_index = tactical_summary.get("recommended_target_index")
-        best_attack_card = self._best_playable_damage_card(combat, target_index=target_index)
+        strategy_constraints = self._load_strategy_constraints(self._configured_character_strategy())
+        best_attack_card = self._best_playable_damage_card(combat, target_index=target_index, strategy_constraints=strategy_constraints)
         best_block_card = self._best_playable_block_card(combat)
-        best_attack_damage = self._card_total_damage_value(best_attack_card) if isinstance(best_attack_card, dict) else 0
+        best_attack_damage = self._card_total_damage_value(best_attack_card, combat=combat, target_index=target_index, strategy_constraints=strategy_constraints) if isinstance(best_attack_card, dict) else 0
         best_block_amount = self._card_block_value(best_block_card) if isinstance(best_block_card, dict) else 0
         incoming_attack_total = self._safe_int(tactical_summary.get("incoming_attack_total"))
         current_block = self._safe_int(tactical_summary.get("current_block"))
@@ -736,7 +1107,8 @@ class STS2AutoplayService:
         target_index = tactical_summary.get("recommended_target_index")
         if target_index is None:
             return None
-        best_card = self._best_playable_damage_card(combat, target_index=target_index)
+        strategy_constraints = self._load_strategy_constraints(self._configured_character_strategy())
+        best_card = self._best_playable_damage_card(combat, target_index=target_index, strategy_constraints=strategy_constraints)
         if best_card is None:
             return None
         return self._action_for_card(actions, best_card, target_index=target_index)
@@ -752,7 +1124,7 @@ class STS2AutoplayService:
             return None
         return self._action_for_card(actions, best_card, target_index=None)
 
-    def _best_playable_damage_card(self, combat: dict[str, Any], *, target_index: Any = None) -> Optional[dict[str, Any]]:
+    def _best_playable_damage_card(self, combat: dict[str, Any], *, target_index: Any = None, strategy_constraints: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         hand = combat.get("hand") if isinstance(combat.get("hand"), list) else []
         best_card: Optional[dict[str, Any]] = None
         best_damage = 0
@@ -763,7 +1135,8 @@ class STS2AutoplayService:
                 valid_targets = card.get("valid_target_indices") if isinstance(card.get("valid_target_indices"), list) else []
                 if valid_targets and self._safe_int(target_index, -9999) not in [self._safe_int(target, -1) for target in valid_targets]:
                     continue
-            damage = self._card_total_damage_value(card)
+            damage = self._card_total_damage_value(card, combat=combat, target_index=target_index, strategy_constraints=strategy_constraints)
+
             if damage > best_damage:
                 best_card = card
                 best_damage = damage
@@ -808,7 +1181,7 @@ class STS2AutoplayService:
 
     async def _select_action_full_model(self, context: dict[str, Any]) -> Optional[dict[str, Any]]:
         self.logger.info("[sts2_autoplay][full-model] stage1 reasoning start")
-        strategy_prompt = self._load_strategy_prompt(self._configured_character_strategy())
+        strategy_prompt = self._strategy_prompt_for_llm(self._configured_character_strategy())
         reasoning_payload = self._build_llm_decision_payload(context, character_strategy=self._configured_character_strategy())
         reasoning_messages = self._build_full_model_reasoning_messages(reasoning_payload, strategy_prompt)
         reasoning_text = await self._invoke_llm_json(reasoning_messages)
@@ -934,7 +1307,7 @@ class STS2AutoplayService:
         return messages
 
     async def _select_action_with_llm(self, strategy: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
-        strategy_prompt = self._load_strategy_prompt(strategy)
+        strategy_prompt = self._strategy_prompt_for_llm(strategy)
         if not strategy_prompt:
             return None
         combat = self._combat_state(context)
@@ -947,10 +1320,6 @@ class STS2AutoplayService:
                     "你当前是在替兰兰做尖塔决策，必须保持兰兰身份并严格从给定的 legal_actions 中选择一个当前合法动作。"
                     "绝不能编造不存在的动作、索引或参数。输出必须是 JSON，不要输出 markdown 或额外解释。"
                 ),
-            },
-            {
-                "role": "system",
-                "content": "你不是通用 API 测试器，也不是旁路工具；你是在兰兰内部工作流里执行游戏决策。",
             },
             {
                 "role": "system",
@@ -1010,19 +1379,114 @@ class STS2AutoplayService:
         self._character_strategy_constraints_cache[strategy_name] = constraints
         return constraints
 
+    def _strategy_sections_for_constraints(self, prompt: str) -> str:
+        headings = self._parse_strategy_heading_sections(prompt)
+        supported_detail_titles = (
+            "战斗偏好",
+            "战斗估算",
+            "估算规则",
+            "商店遗物",
+            "商店药水",
+            "商店不可删除",
+            "商店不可移除",
+            "不可删除卡牌",
+            "不可移除卡牌",
+            "商店删牌规则",
+            "流派必需牌",
+            "流派高优先补强",
+            "条件卡",
+            "慎抓",
+            "低优先",
+            "高优先",
+            "必需",
+        )
+        lines: list[str] = []
+        for section in headings:
+            title = str(section.get("title") or "")
+            lines.extend(section.get("body_lines", []))
+            for detail in section.get("details", []):
+                detail_title = str(detail.get("title") or "")
+                if any(token in detail_title for token in supported_detail_titles):
+                    lines.append(f"#### {detail_title}")
+                    lines.extend(detail.get("body_lines", []))
+            if title == "战斗" and section.get("body_lines"):
+                for detail in section.get("details", []):
+                    detail_title = str(detail.get("title") or "")
+                    if any(token in detail_title for token in {"战斗偏好", "战斗估算", "估算规则"}):
+                        continue
+        return "\n".join(lines).strip()
+
+    def _parse_strategy_heading_sections(self, prompt: str) -> list[dict[str, Any]]:
+        sections: list[dict[str, Any]] = []
+        current_section: Optional[dict[str, Any]] = None
+        current_detail: Optional[dict[str, Any]] = None
+        for raw_line in (prompt or "").splitlines():
+            section_match = re.match(r"^##\s+(.+?)\s*$", raw_line)
+            if section_match:
+                current_section = {"title": section_match.group(1).strip(), "body_lines": [], "details": []}
+                sections.append(current_section)
+                current_detail = None
+                continue
+            detail_match = re.match(r"^###\s+(.+?)\s*$", raw_line)
+            if detail_match and current_section is not None:
+                current_detail = {"title": detail_match.group(1).strip(), "body_lines": []}
+                current_section["details"].append(current_detail)
+                continue
+            if current_detail is not None:
+                current_detail["body_lines"].append(raw_line)
+            elif current_section is not None:
+                current_section["body_lines"].append(raw_line)
+        return sections
+
+    def _strategy_prompt_for_llm(self, strategy: str) -> Optional[str]:
+        prompt = self._load_strategy_prompt(strategy)
+        if not prompt:
+            return None
+        sections = self._parse_strategy_heading_sections(prompt)
+        if not sections:
+            return prompt
+        rendered: list[str] = []
+        for section in sections:
+            title = str(section.get("title") or "").strip()
+            if not title:
+                continue
+            rendered.append(f"## {title}")
+            body_lines = section.get("body_lines") if isinstance(section.get("body_lines"), list) else []
+            while body_lines and not str(body_lines[0]).strip():
+                body_lines = body_lines[1:]
+            rendered.extend(body_lines)
+            for detail in section.get("details", []):
+                detail_title = str(detail.get("title") or "").strip()
+                if not detail_title:
+                    continue
+                rendered.append(f"### {detail_title}")
+                rendered.extend(detail.get("body_lines") if isinstance(detail.get("body_lines"), list) else [])
+            rendered.append("")
+        return "\n".join(rendered).strip() or prompt
+
     def _parse_strategy_constraints(self, prompt: str) -> dict[str, Any]:
         match = re.search(r"^#{2,3}\s*程序约束\s*$([\s\S]*?)(?=^##\s+|\Z)", prompt or "", flags=re.MULTILINE)
-        if not match:
-            return {}
-        section = match.group(1)
+        if match:
+            section = match.group(1)
+        else:
+            section = self._strategy_sections_for_constraints(prompt or "")
+            if not section:
+                return {}
         constraints: dict[str, Any] = {
             "required": {},
             "high_priority": {},
             "conditional": {},
             "low_priority": {},
             "combat_preferences": {},
+            "combat_estimators": {},
+            "shop_preferences": {
+                "relic": {"required": {}, "high_priority": {}, "conditional": {}, "low_priority": {}},
+                "potion": {"required": {}, "high_priority": {}, "conditional": {}, "low_priority": {}},
+                "card": {"required": {}, "high_priority": {}, "conditional": {}, "low_priority": {}, "unremovable": {}},
+            },
         }
         current_category = ""
+        current_shop_type = ""
         for raw_line in section.splitlines():
             line = raw_line.strip()
             if not line:
@@ -1032,8 +1496,41 @@ class STS2AutoplayService:
                 title = heading.group(1).strip()
                 if title == "程序约束":
                     continue
+                current_shop_type = ""
                 if "战斗偏好" in title or "战斗策略" in title:
                     current_category = "combat_preferences"
+                elif "战斗估算" in title or "估算规则" in title:
+                    current_category = "combat_estimators"
+                elif "商店不可删除" in title or "商店不可移除" in title or "不可删除卡牌" in title or "不可移除卡牌" in title:
+                    current_shop_type = "card"
+                    current_category = "unremovable"
+                elif "商店遗物" in title:
+                    current_shop_type = "relic"
+                    if "必需" in title:
+                        current_category = "required"
+                    elif "高优先" in title or "补强" in title:
+                        current_category = "high_priority"
+                    elif "条件" in title:
+                        current_category = "conditional"
+                    elif "慎买" in title or "低优先" in title:
+                        current_category = "low_priority"
+                    else:
+                        current_category = ""
+                elif "商店药水" in title:
+                    current_shop_type = "potion"
+                    if "必需" in title:
+                        current_category = "required"
+                    elif "高优先" in title or "补强" in title:
+                        current_category = "high_priority"
+                    elif "条件" in title:
+                        current_category = "conditional"
+                    elif "慎买" in title or "低优先" in title:
+                        current_category = "low_priority"
+                    else:
+                        current_category = ""
+                elif "商店不可删除" in title or "商店不可移除" in title or "不可删除卡牌" in title or "不可移除卡牌" in title:
+                    current_shop_type = "card"
+                    current_category = "unremovable"
                 elif "必需" in title:
                     current_category = "required"
                 elif "高优先" in title or "补强" in title:
@@ -1056,6 +1553,7 @@ class STS2AutoplayService:
                 key, values = current_category, body
             key = key.strip()
             value_part = values.strip()
+            target_constraints: Any = constraints["shop_preferences"][current_shop_type][current_category] if current_shop_type else constraints[current_category]
             if current_category == "combat_preferences":
                 primary_value, *qualifiers = re.split(r"\|", value_part, maxsplit=1)
                 keywords = [item.strip().lower() for item in re.split(r"[,，、]", primary_value) if item.strip()]
@@ -1068,12 +1566,56 @@ class STS2AutoplayService:
                     if condition_text and condition_text not in entry["conditions"]:
                         entry["conditions"].append(condition_text)
                 continue
-            card_part = value_part.split("|", 1)[0]
-            cards = [card.strip().lower() for card in re.split(r"[,，、]", card_part) if card.strip()]
+            if current_category == "combat_estimators":
+                primary_value, *qualifiers = re.split(r"\|", value_part, maxsplit=1)
+                fields: dict[str, str] = {}
+                keywords: list[str] = []
+                for item in re.split(r"[,，、]", primary_value):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    if "=" in item:
+                        field_key, field_value = item.split("=", 1)
+                        fields[field_key.strip().lower()] = field_value.strip().lower()
+                    else:
+                        keywords.append(item.lower())
+                entry = constraints[current_category].setdefault(key, {"keywords": [], "conditions": []})
+                entry.update(fields)
+                for keyword in keywords:
+                    if keyword not in entry["keywords"]:
+                        entry["keywords"].append(keyword)
+                if qualifiers:
+                    condition_text = qualifiers[0].strip()
+                    if condition_text and condition_text not in entry["conditions"]:
+                        entry["conditions"].append(condition_text)
+                continue
+            if current_category == "conditional":
+                primary_value, *qualifiers = re.split(r"\|", value_part, maxsplit=1)
+                cards = [card.strip().lower() for card in re.split(r"[,，、]", primary_value) if card.strip()]
+                if not cards:
+                    continue
+                entry = target_constraints.setdefault(key, {"items": [], "conditions": []})
+                for card in cards:
+                    if card not in entry["items"]:
+                        entry["items"].append(card)
+                if qualifiers:
+                    condition_text = qualifiers[0].strip()
+                    if condition_text and condition_text not in entry["conditions"]:
+                        entry["conditions"].append(condition_text)
+                continue
+            if current_category == "unremovable":
+                cards = [card.strip().lower() for card in re.split(r"[,，、]", value_part.split("|", 1)[0]) if card.strip()]
+                if not cards:
+                    continue
+                existing = target_constraints.setdefault(key, [])
+                for card in cards:
+                    if card not in existing:
+                        existing.append(card)
+                continue
+            cards = [card.strip().lower() for card in re.split(r"[,，、]", value_part.split("|", 1)[0]) if card.strip()]
             if not cards:
                 continue
-            bucket = constraints[current_category]
-            existing = bucket.setdefault(key, [])
+            existing = target_constraints.setdefault(key, [])
             for card in cards:
                 if card not in existing:
                     existing.append(card)
@@ -1244,10 +1786,11 @@ class STS2AutoplayService:
         enemies = combat.get("enemies") if isinstance(combat.get("enemies"), list) else []
         current_block = self._combat_player_block(combat)
         playable_hand = [card for card in hand if isinstance(card, dict) and bool(card.get("playable"))]
+        constraints = self._load_strategy_constraints(character_strategy or self._configured_character_strategy())
         incoming_attack_total = sum(self._enemy_intent_attack_total(enemy) for enemy in enemies if isinstance(enemy, dict))
         direct_block_total = sum(self._card_block_value(card) for card in playable_hand)
-        direct_damage_total = sum(self._card_total_damage_value(card) for card in playable_hand)
-        best_attack_damage = max((self._card_total_damage_value(card) for card in playable_hand), default=0)
+        direct_damage_total = sum(self._card_total_damage_value(card, combat=combat, strategy_constraints=constraints) for card in playable_hand)
+        best_attack_damage = max((self._card_total_damage_value(card, combat=combat, strategy_constraints=constraints) for card in playable_hand), default=0)
         best_playable_block = max((self._card_block_value(card) for card in playable_hand), default=0)
         lethal_targets: list[dict[str, Any]] = []
         for enemy in enemies:
@@ -1259,9 +1802,9 @@ class STS2AutoplayService:
             target_index = enemy.get("index")
             best_targeted_damage = max(
                 (
-                    self._card_total_damage_value(card)
+                    self._card_total_damage_value(card, combat=combat, target_index=target_index, strategy_constraints=constraints)
                     for card in playable_hand
-                    if self._card_can_target_enemy(card, target_index)
+                    if self._card_can_target_enemy(card, target_index, combat=combat)
                 ),
                 default=0,
             )
@@ -1480,17 +2023,187 @@ class STS2AutoplayService:
                 return max(1, self._safe_int(card.get(key), 1))
         return 1
 
-    def _card_total_damage_value(self, card: dict[str, Any]) -> int:
-        return self._card_damage_value(card) * self._card_hits_value(card)
+    def _card_total_damage_value(self, card: dict[str, Any], combat: Optional[dict[str, Any]] = None, target_index: Any = None, strategy_constraints: Optional[dict[str, Any]] = None) -> int:
+        if not isinstance(card, dict):
+            return 0
+        total = self._card_damage_value(card) * self._card_hits_value(card)
+        total += self._card_strategy_damage_value(card, combat=combat, target_index=target_index, strategy_constraints=strategy_constraints)
+        return total
 
-    def _card_can_target_enemy(self, card: dict[str, Any], target_index: Any) -> bool:
+    def _card_strategy_damage_value(self, card: dict[str, Any], *, combat: Optional[dict[str, Any]] = None, target_index: Any = None, strategy_constraints: Optional[dict[str, Any]] = None) -> int:
+        estimators = strategy_constraints.get("combat_estimators") if isinstance(strategy_constraints, dict) else {}
+        if not isinstance(estimators, dict):
+            return 0
+        damage = 0
+        for name, entry in estimators.items():
+            if not isinstance(entry, dict):
+                continue
+            if not self._card_matches_estimator(card, entry):
+                continue
+            source = str(entry.get("source") or "").strip().lower()
+            if source == "orb_evoke_and_channel":
+                damage += self._card_orb_damage_value(card, combat=combat, target_index=target_index, estimator=entry)
+        return damage
+
+    def _card_matches_estimator(self, card: dict[str, Any], estimator: dict[str, Any]) -> bool:
+        keywords = estimator.get("keywords") if isinstance(estimator.get("keywords"), list) else []
+        if not keywords:
+            return False
+        texts = self._card_text_candidates(card)
+        texts.extend(
+            str(value).strip().lower()
+            for value in (card.get("name"), card.get("id"), card.get("card_id"), card.get("type"), card.get("card_type"))
+            if value is not None and str(value).strip()
+        )
+        return any(str(keyword).strip().lower() in text for keyword in keywords for text in texts)
+
+    def _card_orb_damage_value(self, card: dict[str, Any], *, combat: Optional[dict[str, Any]] = None, target_index: Any = None, estimator: Optional[dict[str, Any]] = None) -> int:
+        if not isinstance(card, dict) or not isinstance(combat, dict):
+            return 0
+        texts = self._card_text_candidates(card)
+        if not texts:
+            return 0
+        keywords = estimator.get("keywords") if isinstance(estimator, dict) and isinstance(estimator.get("keywords"), list) else []
+        if keywords and not any(str(keyword).strip().lower() in text for keyword in keywords for text in texts):
+            return 0
+        orb_state = self._combat_orb_state(combat)
+        if not orb_state:
+            return 0
+        damage = 0
+        if any(keyword in text for text in texts for keyword in {"evoke", "激发"}):
+            damage += self._estimate_orb_evoke_damage(orb_state, texts, target_index=target_index)
+        if any(keyword in text for text in texts for keyword in {"channel", "生成", "唤出"}):
+            damage += self._estimate_orb_channel_damage(orb_state, texts)
+        return damage
+
+    def _combat_orb_state(self, combat: dict[str, Any]) -> list[dict[str, Any]]:
+        for key in ("orbs", "orb_slots", "player_orbs"):
+            value = combat.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        player = combat.get("player") if isinstance(combat.get("player"), dict) else {}
+        for key in ("orbs", "orb_slots", "player_orbs"):
+            value = player.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _estimate_orb_evoke_damage(self, orbs: list[dict[str, Any]], texts: list[str], *, target_index: Any = None) -> int:
+        candidates = [orb for orb in orbs if self._orb_damage_on_evoke(orb, target_index=target_index) > 0]
+        if not candidates:
+            return 0
+        if any(keyword in text for text in texts for keyword in {"all", "所有"}):
+            return sum(self._orb_damage_on_evoke(orb, target_index=target_index) for orb in candidates)
+        return self._orb_damage_on_evoke(candidates[0], target_index=target_index)
+
+    def _estimate_orb_channel_damage(self, orbs: list[dict[str, Any]], texts: list[str]) -> int:
+        if not self._combat_orbs_full(orbs):
+            return 0
+        damage = 0
+        channel_counts = self._channel_orb_counts(texts)
+        for orb_type, count in channel_counts.items():
+            if count <= 0:
+                continue
+            damage += count * self._orb_damage_on_evoke(orbs[0], target_index=None)
+        return damage
+
+    def _combat_orbs_full(self, orbs: list[dict[str, Any]]) -> bool:
+        if not orbs:
+            return False
+        return all(not self._orb_is_empty(orb) for orb in orbs)
+
+    def _channel_orb_counts(self, texts: list[str]) -> dict[str, int]:
+        counts = {"lightning": 0, "dark": 0, "plasma": 0, "frost": 0, "generic": 0}
+        orb_keywords_by_type = {
+            "lightning": {"lightning", "闪电球"},
+            "dark": {"dark", "黑暗球"},
+            "plasma": {"plasma", "等离子球"},
+            "frost": {"frost", "冰球"},
+        }
+        channel_phrases = ["channel", "生成", "唤出"]
+        orb_phrases = ["orb", "球", "充能球"]
+        for text in texts:
+            lowered = text.lower()
+            for phrase in channel_phrases:
+                if phrase not in lowered:
+                    continue
+                tail = lowered.split(phrase, 1)[1].strip()
+                if not tail:
+                    continue
+                multiplier = 1
+                match = re.match(r"\s*(\d+)", tail)
+                if match:
+                    multiplier = max(1, self._safe_int(match.group(1), 1))
+                    tail = tail[match.end():].strip()
+                matched = False
+                for orb_type, keywords in orb_keywords_by_type.items():
+                    if any(keyword in tail for keyword in keywords):
+                        counts[orb_type] += multiplier
+                        matched = True
+                        break
+                if matched:
+                    break
+                if any(keyword in tail for keyword in orb_phrases):
+                    counts["generic"] += multiplier
+                    break
+        return counts
+
+    def _orb_damage_on_evoke(self, orb: dict[str, Any], *, target_index: Any = None) -> int:
+        orb_type = self._orb_type(orb)
+        if orb_type == "lightning":
+            return self._orb_numeric_value(orb, {"evoke_damage", "evoke", "passive_evoke", "damage", "amount"})
+        if orb_type == "dark":
+            return self._orb_numeric_value(orb, {"evoke_damage", "evoke", "damage", "amount", "passive_amount", "current"})
+        return 0
+
+    def _orb_type(self, orb: dict[str, Any]) -> str:
+        texts = [
+            str(orb.get(key) or "").strip().lower()
+            for key in ("type", "orb_type", "id", "name")
+        ]
+        joined = " ".join(texts)
+        if any(keyword in joined for keyword in {"lightning", "闪电"}):
+            return "lightning"
+        if any(keyword in joined for keyword in {"dark", "黑暗"}):
+            return "dark"
+        if any(keyword in joined for keyword in {"frost", "冰"}):
+            return "frost"
+        if any(keyword in joined for keyword in {"plasma", "等离子"}):
+            return "plasma"
+        return ""
+
+    def _orb_numeric_value(self, orb: dict[str, Any], keys: set[str]) -> int:
+        for key in keys:
+            value = self._first_numeric_value(orb.get(key))
+            if value is not None:
+                return max(0, value)
+        dynamic_values = orb.get("dynamic_values") if isinstance(orb.get("dynamic_values"), list) else []
+        normalized_keys = {key.strip().lower() for key in keys}
+        for item in dynamic_values:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip().lower()
+            if name not in normalized_keys:
+                continue
+            for field in ("current_value", "enchanted_value", "base_value", "value"):
+                value = self._first_numeric_value(item.get(field))
+                if value is not None:
+                    return max(0, value)
+        return 0
+
+    def _orb_is_empty(self, orb: dict[str, Any]) -> bool:
+        texts = [str(orb.get(key) or "").strip().lower() for key in ("type", "orb_type", "id", "name")]
+        joined = " ".join(texts)
+        return joined in {"", "empty", "none", "空", "empty slot"}
+
+    def _card_can_target_enemy(self, card: dict[str, Any], target_index: Any, combat: Optional[dict[str, Any]] = None) -> bool:
         if not isinstance(card, dict):
             return False
         if target_index is None:
-            return self._card_total_damage_value(card) > 0
+            return self._card_total_damage_value(card, combat=combat) > 0
         valid_targets = card.get("valid_target_indices") if isinstance(card.get("valid_target_indices"), list) else []
         if not valid_targets:
-            return self._card_total_damage_value(card) > 0
+            return self._card_total_damage_value(card, combat=combat, target_index=target_index) > 0
         normalized_target = self._safe_int(target_index, -9999)
         return normalized_target in [self._safe_int(target, -1) for target in valid_targets]
 
@@ -1752,6 +2465,26 @@ class STS2AutoplayService:
         client = self._require_client()
         action_type = str(prepared.get("action_type") or "")
         kwargs = prepared.get("kwargs") if isinstance(prepared.get("kwargs"), dict) else {}
+        context = prepared.get("context") if isinstance(prepared.get("context"), dict) else {}
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        screen = snapshot.get("screen") or snapshot.get("normalized_screen") or "unknown"
+        actions = context.get("actions") if isinstance(context.get("actions"), list) else []
+        action_summaries = [
+            {
+                "type": str(action.get("type") or ""),
+                "raw_name": str(action.get("raw", {}).get("name") or "") if isinstance(action.get("raw"), dict) else "",
+                "allowed_kwargs": self._allowed_kwargs_for_action(
+                    str(action.get("type") or ""),
+                    action.get("raw") if isinstance(action.get("raw"), dict) else {},
+                    context,
+                ),
+            }
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        self.logger.info(
+            f"[sts2_autoplay][action] screen={screen} action_type={action_type} kwargs={kwargs} available_actions={action_summaries}"
+        )
         result = await client.execute_action(action_type, **kwargs)
         self._last_action = action_type
         self._last_action_at = time.time()
@@ -1763,14 +2496,19 @@ class STS2AutoplayService:
         kwargs = {
             k: v
             for k, v in raw.items()
-            if k not in {"type", "name", "label", "description", "requires_target", "requires_index"}
+            if k not in {"type", "name", "label", "description", "requires_target", "requires_index", "shop_remove_selection"}
             and not (k == "action" and isinstance(v, dict))
         }
         if action_type in {"choose_reward_card", "select_deck_card", "skip_reward_cards", "collect_rewards_and_proceed", "claim_reward"}:
             reward_options = self._card_reward_options(raw, context)
             if reward_options:
                 self._log_card_reward_options(reward_options, context)
-        if action_type in {"choose_reward_card", "select_deck_card"}:
+        allowed_option_indices = self._allowed_kwargs_for_action(action_type, raw, context).get("option_index", [])
+        if action_type in {"choose_reward_card", "select_deck_card"} and not bool(raw.get("shop_remove_selection")):
+            shop_remove_index = self._find_shop_remove_card_index_for_selection(context)
+            if shop_remove_index is not None:
+                kwargs["option_index"] = shop_remove_index
+                return kwargs
             preferred_option_index = self._find_preferred_card_option_index(raw, context)
             if preferred_option_index is not None:
                 kwargs["option_index"] = preferred_option_index
@@ -1784,6 +2522,8 @@ class STS2AutoplayService:
                 if preferred_option_index is None:
                     preferred_option_index = self._find_preferred_character_option_index(raw, context)
                 chosen_option_index = preferred_option_index if preferred_option_index is not None else 0
+                if allowed_option_indices and int(chosen_option_index) not in allowed_option_indices:
+                    chosen_option_index = allowed_option_indices[0]
                 kwargs["option_index"] = chosen_option_index
             elif action_type == "use_potion":
                 kwargs["option_index"] = self._find_usable_potion_index(context)
@@ -1795,6 +2535,31 @@ class STS2AutoplayService:
             else:
                 kwargs["index"] = 0
         return kwargs
+
+    def _find_shop_remove_card_index_for_selection(self, context: dict[str, Any]) -> Optional[int]:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        if self._normalized_screen_name(snapshot) != "card_selection":
+            return None
+        if not self._is_shop_remove_selection_context(context):
+            return None
+        actions = context.get("actions") if isinstance(context.get("actions"), list) else []
+        has_select_deck_card = any(
+            isinstance(action, dict) and str(action.get("type") or "") == "select_deck_card"
+            for action in actions
+        )
+        if not has_select_deck_card:
+            return None
+        remove_index = self._find_shop_remove_card_index(context)
+        return remove_index
+
+    def _is_shop_remove_selection_context(self, context: dict[str, Any]) -> bool:
+        snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+        raw_state = snapshot.get("raw_state") if isinstance(snapshot.get("raw_state"), dict) else {}
+        shop = raw_state.get("shop") if isinstance(raw_state.get("shop"), dict) else {}
+        card_removal = shop.get("card_removal") if isinstance(shop.get("card_removal"), dict) else {}
+        if bool(card_removal.get("available")) and bool(card_removal.get("enough_gold")):
+            return True
+        return self._last_action == "remove_card_at_shop"
 
     def _find_preferred_card_option_index(self, raw: dict[str, Any], context: dict[str, Any]) -> Optional[int]:
         if self._configured_character_strategy() != "defect":
@@ -1848,6 +2613,11 @@ class STS2AutoplayService:
                     "constraint_hits": details["constraint_hits"],
                     "base_score": details["base_score"],
                 })
+            snapshot = context.get("snapshot") if isinstance(context.get("snapshot"), dict) else {}
+            screen = self._normalized_screen_name(snapshot)
+            self.logger.info(
+                f"[sts2_autoplay][reward-options] screen={screen} option_count={len(scored_options)} scored_options={scored_options}"
+            )
         except Exception as exc:
             self.logger.warning(f"记录卡牌奖励候选失败: {exc}")
 
